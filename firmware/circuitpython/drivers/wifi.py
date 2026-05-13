@@ -8,7 +8,7 @@ import socketpool
 
 
 class WiFiDriver:
-    """WiFi driver"""
+    """ESP32-S3 WiFi driver"""
     
     def __init__(self, config):
         self.config = config

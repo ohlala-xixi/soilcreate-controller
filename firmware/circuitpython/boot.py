@@ -13,37 +13,35 @@ import digitalio
 # ============================================================
 # 启动时立即设置所有输出 GPIO 到安全电平
 # 防止深度休眠醒来后 GPIO 浮空导致外设误动作
+# 基于原理图 SCH_Schematic1_2026-05-11
 # ============================================================
 
 def _init_safe_gpio():
     """将所有输出引脚设为安全电平 (在 code.py 驱动初始化前)
     每个引脚独立 try/except，避免单个引脚冲突导致启动失败
-    基于原理图 SCH_Schematic1_2026-03-13
     """
     _safe_pins = []
-    
+
     _pin_list = [
-        # RS485 VCC (VOUTCTRL) → LOW (传感器断电, 上电默认全断)
-        (microcontroller.pin.GPIO48, "COM1_VCC(VOUTCTRL4)"),
-        (microcontroller.pin.GPIO13, "COM2_VCC(VOUTCTRL3)"),
-        (microcontroller.pin.GPIO18, "COM3_VCC(VOUTCTRL2)"),
-        (microcontroller.pin.GPIO6,  "COM4_VCC(VOUTCTRL1)"),
+        # RS485 VCC (VOUTCTR) → LOW (传感器断电, 上电默认全断)
+        (microcontroller.pin.GPIO37, "COM1_VCC(VOUTCTR4)"),
+        (microcontroller.pin.GPIO35, "COM2_VCC(VOUTCTR3)"),
         # RS485 DE → LOW (接收模式)
-        (microcontroller.pin.GPIO45, "COM1_DE(485CTR4)"),
-        (microcontroller.pin.GPIO14, "COM2_DE(485CTR3)"),
-        (microcontroller.pin.GPIO8,  "COM3_DE(485CTR2)"),
-        (microcontroller.pin.GPIO7,  "COM4_DE(485CTRL1)"),
+        (microcontroller.pin.GPIO38, "COM1_DE(485CTR4)"),
+        (microcontroller.pin.GPIO45, "COM2_DE(485CTR3)"),
         # RS485 SCAN → LOW (各通道独立)
-        (microcontroller.pin.GPIO37, "COM1_SCAN(SCAN4)"),
-        (microcontroller.pin.GPIO41, "COM2_SCAN(SCAN3)"),
-        (microcontroller.pin.GPIO21, "COM3_SCAN(SCAN2)"),
-        (microcontroller.pin.GPIO17, "COM4_SCAN(SCAN1)"),
-        # W5500 ETH_RST → LOW then HIGH
-        (microcontroller.pin.GPIO46, "ETH_RST"),
-        # 4G 电源 → LOW (默认关闭)
-        (microcontroller.pin.GPIO42, "4G_PWR(V4G_CTRL)"),
+        (microcontroller.pin.GPIO36, "COM1_SCAN(SCAN4)"),
+        (microcontroller.pin.GPIO48, "COM2_SCAN(SCAN3)"),
+        # W5500 ETH_RST → LOW (复位脚, 旧板在 GPIO46, 新板搬到 GPIO3)
+        (microcontroller.pin.GPIO3,  "ETH_RST"),
+        # 4G 电源 → LOW (默认关闭, V4G_CTRL 旧板 GPIO42 → 新板 GPIO14)
+        (microcontroller.pin.GPIO14, "4G_PWR(V4G_CTRL)"),
+        # 12V boost 使能 → LOW (默认关, 省电; 用前 code.py 再开)
+        (microcontroller.pin.GPIO39, "BOOST_EN(SPWALLON)"),
+        # 电流 sense LDO 使能 → LOW (默认关, 读电流前再开)
+        (microcontroller.pin.GPIO40, "CURCTR"),
     ]
-    
+
     ok_count = 0
     for pin, name in _pin_list:
         try:
@@ -54,11 +52,11 @@ def _init_safe_gpio():
             ok_count += 1
         except Exception as e:
             print(f"[BOOT] GPIO {name} 跳过: {e}")
-    
+
     # 释放所有引脚 (code.py 的驱动会重新初始化)
     for p in _safe_pins:
         p.deinit()
-    
+
     print(f"[BOOT] N8R2 GPIO 安全初始化: {ok_count}/{len(_pin_list)}")
 
 _init_safe_gpio()
@@ -88,4 +86,3 @@ else:
     # flash mode：电脑可readwrite，设备readonly
     print(f"[BOOT] flash mode(nvm={nvm_value}) - 电脑可readwrite，设备readonly")
     print("[BOOT] Data CDC enabled. USB mass storage read & write.")
-

@@ -1,6 +1,6 @@
 #!/bin/bash
 # deploy_circuitpython.sh - 部署 CircuitPython 代码到 CIRCUITPY 驱动器
-# 柔性测斜仪控制器
+# ESP32-S3 柔性测斜仪控制器
 
 set -e
 
@@ -18,7 +18,7 @@ if [ ! -d "$DST_DIR" ]; then
     echo "❌ CIRCUITPY 驱动器未挂载!"
     echo ""
     echo "请确保:"
-    echo "  1. 已烧录 CircuitPython 固件"
+    echo "  1. ESP32-S3 已烧录 CircuitPython 固件"
     echo "  2. 设备已通过 USB 连接"
     echo "  3. 如果看不到驱动器，尝试双击 RESET 进入安全模式"
     exit 1
@@ -43,13 +43,7 @@ cp "$SRC_DIR/code.py" "$DST_DIR/"
 cp "$SRC_DIR/pins.py" "$DST_DIR/"
 
 # 复制配置文件
-# config.default 总是覆盖（BLE load_default 读这个文件恢复出厂配置）
-if [ -f "$SRC_DIR/config.default" ]; then
-    cp "$SRC_DIR/config.default" "$DST_DIR/"
-    echo "   ✓ config.default"
-fi
-
-# config.json 也覆盖（#sync_config CDC 命令读它合并到 NVM）
+# config.json: NVM 空时兜底读取, 也是 #sync_config / BLE sync_config 的源
 cp "$SRC_DIR/config.json" "$DST_DIR/"
 echo "   ✓ config.json"
 

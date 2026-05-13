@@ -71,6 +71,7 @@ class DataFormatter:
         segments = []
         
         # 手动构建 header JSON 确保 key 顺序匹配协议规范
+        # V1 / V2 沿用协议字段名, 数据源是 v485_4 (COM1 VCC4) / v485_3 (COM2 VCC3)
         clock_str = self._format_clock(current_time)
         header_str = (
             f'{{"cid":{int(device_id)},'
@@ -79,8 +80,9 @@ class DataFormatter:
             f'"V4G":{int(voltages.get("V4G", 0) * 100)},'
             f'"vin":{round(voltages.get("vin", 0), 2)},'
             f'"V5V":{int(voltages.get("V5V", 0) * 100)},'
-            f'"V1":{round(voltages.get("V1", 0), 2)},'
-            f'"V2":{round(voltages.get("V2", 0), 2)},'
+            f'"V1":{round(voltages.get("v485_4", 0), 2)},'
+            f'"V2":{round(voltages.get("v485_3", 0), 2)},'
+            f'"current":{int(voltages.get("current_ma", 0))},'
             f'"clock":"{clock_str}",'
             f'"time":{current_time},'
             f'"hib":{interval_preset},'

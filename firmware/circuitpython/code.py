@@ -1,4 +1,4 @@
-# code.py - 柔性测斜仪控制器主程序
+# code.py - ESP32-S3 柔性测斜仪控制器主程序
 # CircuitPython 同步版本 (不使用 asyncio)
 
 import time
@@ -91,15 +91,7 @@ def file_exists(path):
         return False
 
 def _make_modem(config, log_func):
-    """按 config.network.4g.modem 选择 4G 驱动实现
-
-    A7670C_yundtu : 飞思创 YunDTU 封装 AT (A7670C DTU 产品) → modem_4g.py (默认)
-    A7670G        : SIMCom A76XX 原生 AT (A7670G 裸模块等)  → modem_simcom.py
-    """
-    modem_type = config.get("network.4g.modem", "A7670C_yundtu")
-    if modem_type == "A7670G":
-        from drivers.modem_simcom import ModemSimcom
-        return ModemSimcom(config, log_func)
+    """4G 驱动 (A7670C YunDTU)"""
     from drivers.modem_4g import Modem4G
     return Modem4G(config, log_func)
 
@@ -142,6 +134,50 @@ def get_sleep_until_next_boundary(interval_sec):
 # 时间同步
 _last_send_day = -1  # 上次发送的日期 (yday)，内存中记录
 _force_collect_now = False  # BLE read_sensors 触发: 跳过 ble.is_connected() 中断检查, 强制完成本轮采集+上传
+
+# 05-11 新硬件: SPWALLON (12V boost EN) + CURCTR (电流sense LDO EN) + 共享 VoltageMonitor 句柄
+# 在 main() 初始化, 各 cmd handler 通过 module-level 引用 (避免改 process_commands 签名)
+_boost_en_pin = None
+_curctr_pin = None
+_voltage_monitor = None
+
+def _init_new_hw_pins():
+    """初始化 05-11 新硬件 GPIO (BOOST_EN / CURCTR) — 由 main() 调用一次"""
+    global _boost_en_pin, _curctr_pin
+    import digitalio
+    import pins
+    try:
+        _boost_en_pin = digitalio.DigitalInOut(pins.BOOST_EN)
+        _boost_en_pin.direction = digitalio.Direction.OUTPUT
+        _boost_en_pin.value = False
+    except Exception as e:
+        log(f"[HW] BOOST_EN init fail: {e}")
+    try:
+        _curctr_pin = digitalio.DigitalInOut(pins.CURCTR)
+        _curctr_pin.direction = digitalio.Direction.OUTPUT
+        _curctr_pin.value = False
+    except Exception as e:
+        log(f"[HW] CURCTR init fail: {e}")
+
+
+def set_boost(enabled: bool):
+    """打开/关闭 12V boost (SPWALLON)"""
+    if _boost_en_pin is None:
+        return
+    _boost_en_pin.value = bool(enabled)
+
+
+def read_system_current() -> int:
+    """读系统总电流 (mA) — 自动开 CURCTR LDO, 读完关掉省电"""
+    if _voltage_monitor is None or _curctr_pin is None:
+        return 0
+    import time
+    _curctr_pin.value = True
+    time.sleep(0.02)   # 给 LDO + ACS712 上电稳定时间
+    i_ma = _voltage_monitor.read_current()
+    _curctr_pin.value = False
+    return i_ma
+
 
 def _parse_gsm_time(time_str):
     """解析 GSM 时间 'YY/MM/DD,HH:MM:SS+TZ' → struct_time
@@ -719,11 +755,13 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
             wifi_enabled = config.get("network.wifi.enabled", False) if config else False
             g4_enabled = config.get("network.4g.enabled", False) if config else False
             eth_enabled = config.get("network.ethernet.enabled", False) if config else False
-            expansion_enabled = config.get("network.expansion.enabled", False) if config else False
             # 存储status
             storage_enabled = config.get("local_storage.enabled", False) if config else False
             usb_msc = config.get("system.usb_msc_enabled", True) if config else True
-            
+            # 电源/电流 (05-11 新硬件)
+            boost_on = _boost_en_pin.value if _boost_en_pin else False
+            current_ma = read_system_current() if _voltage_monitor else 0
+
             log("========== SYSstatus ==========")
             log(f"设备ID: {device_id}")
             log(f"Interval: {interval}")
@@ -734,7 +772,9 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
             log(f"WiFi: {'on' if wifi_enabled else 'off'}")
             log(f"4G: {'on' if g4_enabled else 'off'}")
             log(f"ETH: {'on' if eth_enabled else 'off'}")
-            log(f"extended板: {'on' if expansion_enabled else 'off'}")
+            log("--- 电源 ---")
+            log(f"12V boost: {'ON' if boost_on else 'OFF'}")
+            log(f"系统电流: {current_ma} mA")
             log("--- 存储功能 ---")
             log(f"storage: {'on' if storage_enabled else 'off'}")
             usb_rw = config.get("system.usb_rw", False) if config else False
@@ -800,29 +840,6 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
                 log(f"[SyncCfg] err: {e}")
             continue
 
-        elif cmd_name == "#load_default":
-            # 从 /config.default 整个覆盖 NVM (出厂配置, 与 BLE load_default 等价)
-            if not config:
-                log("[LoadDefault] no config manager")
-                continue
-            try:
-                import json as _json
-                with open("/config.default", "r") as _f:
-                    default_cfg = _json.load(_f)
-                if not isinstance(default_cfg, dict):
-                    log("[LoadDefault] /config.default 不是 JSON 对象")
-                    continue
-                config.set_all(default_cfg)
-                log(f"[LoadDefault] factory config loaded ({len(default_cfg)} top-level keys)")
-                log("[LoadDefault] send #reboot or Ctrl+D 生效")
-            except OSError as e:
-                log(f"[LoadDefault] read /config.default failed: {e}")
-            except ValueError as e:
-                log(f"[LoadDefault] JSON 解析失败: {e}")
-            except Exception as e:
-                log(f"[LoadDefault] err: {e}")
-            continue
-
         elif cmd_name == "#help":
             log("========== CDC cmdhelp ==========")
             log("--- 操作cmd ---")
@@ -850,9 +867,12 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
             log("#enable_4g / #disable_4g")
             log("#enable_wifi / #disable_wifi")
             log("#enable_eth / #disable_eth")
-            log("#enable_expansion / #disable_expansion")
             log("#enable_storage / #disable_storage - storageonoff")
             log("#enable_rs485_log / #disable_rs485_log - RS485 TX/RX hex log")
+            log("--- 电源/电流 (05-11 新硬件) ---")
+            log("#enable_boost / #disable_boost - 12V boost on/off")
+            log("#get_current            - 读系统总电流 (A)")
+            log("#diag_com <1|2>         - VCC 通电诊断")
             log("--- SYScmd ---")
             log("#status                 - 查看status(含net/存储)")
             log("#version                - 固件Ver")
@@ -861,7 +881,6 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
             log("#disable_usb_rw         - 设备可readwrite(daily mode,重启生效)")
             log("#usb_rw_status          - 查看USBreadwrite模式")
             log("#sync_config            - 从 /config.json 合并进 NVM")
-            log("#load_default           - 从 /config.default 整个覆盖 NVM (出厂配置)")
             log("==================================")
             continue
         
@@ -950,25 +969,49 @@ def process_commands(rs485_drivers, rs485_protocols, config=None):
                 config.save()
                 log("[ETH] doneoff")
             continue
-        
-        elif cmd_name == "#enable_expansion":
-            if config:
-                config.set("system.expansion_ports_enable", True)
-                config.set("rs485_3.enabled", True)
-                config.set("rs485_4.enabled", True)
-                config.save()
-                log("[Expansion port] doneon (SC16IS752: com3, com4)")
+
+        # ========== 电源/电流 (05-11 新硬件) ==========
+        elif cmd_name == "#enable_boost":
+            set_boost(True)
+            log("[BOOST] 12V boost ON")
             continue
-        
-        elif cmd_name == "#disable_expansion":
-            if config:
-                config.set("system.expansion_ports_enable", False)
-                config.set("rs485_3.enabled", False)
-                config.set("rs485_4.enabled", False)
-                config.save()
-                log("[Expansion port] doneoff")
+
+        elif cmd_name == "#disable_boost":
+            set_boost(False)
+            log("[BOOST] 12V boost OFF")
             continue
-        
+
+        elif cmd_name == "#get_current":
+            i_ma = read_system_current()
+            log(f"[CURRENT] {i_ma} mA")
+            continue
+
+        elif cmd_name == "#diag_com":
+            # 用法: #diag_com 1   ← 验证 COM1 VCC 通断
+            if len(parts) < 2 or parts[1] not in ("1", "2"):
+                log("[DIAG] 用法: #diag_com <1|2>")
+                continue
+            ch = int(parts[1])
+            if ch not in rs485_drivers:
+                log(f"[DIAG] COM{ch} 未初始化, 检查 config.json")
+                continue
+            v_key = "v485_4" if ch == 1 else "v485_3"
+            driver = rs485_drivers[ch]
+            # 断电读基线
+            driver.power_off()
+            import time
+            time.sleep(0.1)
+            v_off = _voltage_monitor.read(v_key) if _voltage_monitor else 0.0
+            # 通电读
+            driver.power_on()
+            time.sleep(0.2)   # 等 12V 稳定
+            v_on = _voltage_monitor.read(v_key) if _voltage_monitor else 0.0
+            # 恢复断电
+            driver.power_off()
+            ok = v_on >= 9.0 and v_off < 2.0
+            log(f"[DIAG] COM{ch}: VCC off={v_off:.2f}V, on={v_on:.2f}V → {'OK' if ok else 'FAIL'}")
+            continue
+
         elif cmd_name == "#enable_storage":
             if config:
                 config.set("local_storage.enabled", True)
@@ -1449,19 +1492,6 @@ def process_ble_command(ble, config, rs485_drivers=None, rs485_protocols=None) -
                 log(f"[BLE] import_address_list: {result}")
                 return "reload_config"
         
-        elif cmd_type == "load_default":
-            # 从 /config.default 导入出厂初始配置到 NVM
-            try:
-                with open("/config.default", "r") as f:
-                    default_cfg = json.load(f)
-                config.set_all(default_cfg)
-                ble.send(json.dumps({"cmd": "load_default", "ok": True}) + "\n")
-                log("[BLE] load_default: factory config loaded")
-                return "reload_config"
-            except Exception as e:
-                ble.send(json.dumps({"cmd": "load_default", "ok": False, "error": str(e)}) + "\n")
-                log(f"[BLE] load_default failed: {e}")
-
         elif cmd_type == "sync_config":
             # 从 /config.json 合并进 NVM (与 CDC #sync_config 等价)
             try:
@@ -2117,7 +2147,7 @@ def process_ble_command(ble, config, rs485_drivers=None, rs485_protocols=None) -
 def main():
     global _force_collect_now
     log("=" * 50)
-    log("  柔性测斜仪控制器 - 同步版")
+    log("  ESP32-S3 柔性测斜仪控制器 - 同步版")
     log("=" * 50)
     
     # 加载配置（从 NVM，若空则用默认值）
@@ -2139,6 +2169,14 @@ def main():
     counter = UploadCounter()
     fw_version = config.get("system.firmware_version", FIRMWARE_VERSION)
     formatter = DataFormatter(config, counter, fw_version)
+
+    # 05-11 新硬件: 初始化 SPWALLON / CURCTR + 全局暴露 voltage 供 cmd handler 使用
+    global _voltage_monitor
+    _voltage_monitor = voltage
+    _init_new_hw_pins()
+    if config.get("power.boost_auto", True):
+        set_boost(True)   # 默认开 boost (12V 路径供 RS485 VCC + 备用 4G 模组)
+        log("[HW] 12V boost: ON (boost_auto)")
     
     # 初始化本地存储
     from lib.local_storage import LocalStorage

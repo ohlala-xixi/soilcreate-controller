@@ -23,21 +23,16 @@ class RS485Driver:
         ch_pins = pins.RS485_CHANNELS.get(channel)
         if not ch_pins:
             raise ValueError(f"invalid的 RS485 CH: {channel}")
-        
+
         # 硬件 UART + rs485_dir 自动 DE 管理
-        if ch_pins.get("type") == "hardware":
-            self.uart = busio.UART(
-                ch_pins["tx"], ch_pins["rx"],
-                baudrate=baud,
-                timeout=0.1,
-                bits=8, parity=None, stop=1,
-                rs485_dir=ch_pins["de"],    # 硬件自动管理 DE
-                rs485_invert=False          # DE=HIGH 发送
-            )
-        else:
-            # SC16IS752 extendedCH (needs I2C driver)
-            self.uart = None
-            print(f"[RS485] CH {channel} isextendedCH，needs SC16IS752 driver")
+        self.uart = busio.UART(
+            ch_pins["tx"], ch_pins["rx"],
+            baudrate=baud,
+            timeout=0.1,
+            bits=8, parity=None, stop=1,
+            rs485_dir=ch_pins["de"],    # 硬件自动管理 DE
+            rs485_invert=False          # DE=HIGH 发送
+        )
         
         # VCC Power ctrl引脚
         self.vcc_pin = digitalio.DigitalInOut(ch_pins["vcc"])
@@ -70,18 +65,13 @@ class RS485Driver:
     
     def send(self, data: bytes):
         """发送数据 — DE 由硬件自动管理，精确到 bit 级别"""
-        if self.uart is None:
-            return
         self.uart.write(data)
-    
+
     def read(self, size: int = 64, timeout_ms: int = 200, expected_bytes: int = 0) -> bytes:
         """readdata (blocking, with gap detection matching ref ui_main.py)
-        
+
         expected_bytes > 0 时：收到足够字节立即返回，gap 延长至 500ms
         """
-        if self.uart is None:
-            return None
-        
         start = time.monotonic()
         buffer = bytearray()
         last_recv_time = 0
@@ -119,38 +109,37 @@ class RS485Driver:
             except:
                 pass
 
-    def send_and_receive(self, command: bytes, response_size: int = 64, 
+    def send_and_receive(self, command: bytes, response_size: int = 64,
                           timeout_ms: int = 200, expected_bytes: int = 0) -> bytes:
         """sendcommand并recvresponse (timing matching ref ui_main.py)"""
         # 清空接收缓冲区
-        if self.uart and self.uart.in_waiting:
+        if self.uart.in_waiting:
             self.uart.read(self.uart.in_waiting)
-        
+
         # send
         self.send(command)
-        
+
         # recv
         result = self.read(response_size, timeout_ms, expected_bytes)
-        
+
         # RX log only
         if self.cdc_log:
             self._cdc_print(f"  [CH{self.channel}] RX: {result.hex().upper() if result else 'None'}")
-        
+
         # 清理残留数据
-        if self.uart and self.uart.in_waiting:
+        if self.uart.in_waiting:
             self.uart.read(self.uart.in_waiting)
-        
+
         return result
-    
+
     def clear_buffer(self):
         """清nullrecvbuffer"""
-        if self.uart and self.uart.in_waiting:
+        if self.uart.in_waiting:
             self.uart.read(self.uart.in_waiting)
-    
+
     def deinit(self):
         """Release resources"""
         self.power_off()
-        if self.uart:
-            self.uart.deinit()
+        self.uart.deinit()
         self.vcc_pin.deinit()
         self.scan_pin.deinit()

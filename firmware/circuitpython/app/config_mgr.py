@@ -8,28 +8,27 @@ import struct
 
 class ConfigManager:
     """NVM 配置管理器
-    
+
     NVM 布局:
       nvm[0]     = USB 模式标志 (boot.py 独立管理)
       nvm[1:9]   = 保留
       nvm[10:12] = uint16 big-endian 长度头
       nvm[12:]   = JSON UTF-8 字符串
-    NVM 为空时使用 _get_defaults() 硬编码兜底；
-    出厂初始配置从 /config.default 文件加载（由 BLE load_default 命令触发）。
+    NVM 为空时从 /config.json 兜底读取（固件烧录时附带的初始配置）。
     """
-    
+
     NVM_OFFSET = 10   # 配置数据起始偏移
     HEADER_SIZE = 2   # uint16 big-endian 长度头
     NVM_MAX = len(microcontroller.nvm) - NVM_OFFSET - HEADER_SIZE
-    
+
     def __init__(self):
         self.config = {}
-        
+
         if self._nvm_has_valid_config():
             print("[ConfigMgr] loaded from NVM")
         else:
-            print("[ConfigMgr] NVM empty, using defaults (点APP导入配置)")
-            self.config = self._get_defaults()
+            print("[ConfigMgr] NVM empty, reading /config.json (点APP导入配置后会写入NVM)")
+            self.config = self._load_from_file()
     
     def _nvm_has_valid_config(self) -> bool:
         """检查 NVM 是否有有效 JSON 配置，并加载"""
@@ -56,16 +55,16 @@ class ConfigManager:
             length = struct.unpack(">H", microcontroller.nvm[o:o+2])[0]
             if length == 0 or length > self.NVM_MAX:
                 print("[ConfigMgr] NVM data invalid")
-                self.config = self._get_defaults()
+                self.config = self._load_from_file()
                 return False
-            
+
             json_bytes = bytes(microcontroller.nvm[o+2:o+2 + length])
             self.config = json.loads(json_bytes.decode("utf-8"))
             print(f"[ConfigMgr] loaded from NVM: {length} bytes")
             return True
         except Exception as e:
             print(f"[ConfigMgr] NVM load failed: {e}")
-            self.config = self._get_defaults()
+            self.config = self._load_from_file()
             return False
     
     def save(self) -> bool:
@@ -227,52 +226,15 @@ class ConfigManager:
         self.config[key]["sensors"] = sensors
         self.config[key]["enabled"] = True
     
-    def _get_defaults(self) -> dict:
-        return {
-            "system": {
-                "id": "2026750001",
-                "interval_preset": 5,
-                "interval_custom_min": 60,
-                "max_sensors_per_seg": 15,
-                "sleep_between_polls": True,
-                "sleep_mode": "light",
-                "log_level": "INFO",
-                "usb_rw": True,
-                "rs485_ext": False,
-                "merge_segments": False
-            },
-            "local_storage": {
-                "enabled": False,
-                "period": "month"
-            },
-            "ble": {
-                "name": "UniControl",
-                "pin": "1234",
-                "enabled": True
-            },
-            "network": {
-                "priority": ["4g", "wifi", "ethernet", "usb_cdc"],
-                "mqtt_broker": "47.95.250.46",
-                "mqtt_port": 1883,
-                "mqtt_topic": "controllerdata-cirpy",
-                "mqtt_user": "rasberdevice",
-                "mqtt_pass": "***",
-                "4g": {"enabled": True, "modem": "A7670C_yundtu", "apn": "cmnet", "cops": "0"},
-                "wifi": {"enabled": False, "ssid": "", "password": "***"},
-                "ethernet": {"enabled": False}
-            },
-            "rs485_1": {
-                "enabled": True,
-                "baud": 9600,
-                "protocol": "PRIVATE_V2026",
-                "power_on_delay_ms": 100,
-                "sensors": []
-            },
-            "rs485_2": {
-                "enabled": True,
-                "baud": 9600,
-                "protocol": "PRIVATE_V2026",
-                "power_on_delay_ms": 100,
-                "sensors": []
-            }
-        }
+    def _load_from_file(self) -> dict:
+        """NVM 空时兜底: 从 /config.json 读取 (固件烧录附带的初始配置)"""
+        try:
+            with open("/config.json", "r") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict):
+                print(f"[ConfigMgr] /config.json loaded: {len(cfg)} top-level keys")
+                return cfg
+            print("[ConfigMgr] /config.json 不是 JSON 对象")
+        except Exception as e:
+            print(f"[ConfigMgr] /config.json read failed: {e}")
+        return {}
