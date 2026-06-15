@@ -8,6 +8,42 @@ import usb_cdc
 import pins
 
 
+# 12V boost (XL6019/BOOST_EN) 控制钩子: 由 code.py 注入它的 set_boost(bool)。
+# BOOST_EN 这个 GPIO 归 code.py 的 _boost_en_pin 所有 (driver 不能再建一个 DigitalInOut),
+# 所以这里用回调而不是直接控脚。注入前 = None = 不控 boost (向后兼容/测试)。
+_boost_ctrl = None
+_boost_refs = 0          # 引用计数: 当前有几处在用 12V (防一处 off 把别处的 boost 关了)
+_BOOST_SETTLE_S = 0.3    # 开 SPWALLON 后等 12V 建立 (XL6019 软启动) 再接 VOUTCTR
+
+
+def set_boost_control(fn):
+    """code.py 注入 set_boost; 之后 power_on/power_off + 外层 boost_acquire/release 自动管 12V"""
+    global _boost_ctrl
+    _boost_ctrl = fn
+
+
+def boost_acquire():
+    """占用 12V (SPWALLON): 第一个占用者开 boost + 等 12V 建立; 之后只加计数。
+    采集循环外层 hold 一个、每通道 power_on 再加一个 → 整个采集 SPWALLON 只开一次。"""
+    global _boost_refs
+    if _boost_ctrl is None:
+        return
+    if _boost_refs == 0:
+        _boost_ctrl(True)
+        time.sleep(_BOOST_SETTLE_S)
+    _boost_refs += 1
+
+
+def boost_release():
+    """释放 12V: 计数归零时才真正关 SPWALLON"""
+    global _boost_refs
+    if _boost_ctrl is None:
+        return
+    if _boost_refs > 0:
+        _boost_refs -= 1
+    if _boost_refs == 0:
+        _boost_ctrl(False)
+
 
 class RS485Driver:
     """RS485 UART driver，使用硬件 rs485_dir 自动管理 DE 引脚"""
@@ -45,19 +81,21 @@ class RS485Driver:
         self.scan_pin.value = False  # defaultoff
     
     def power_on(self):
-        """opensensor电源"""
+        """opensensor电源: 占用 12V(SPWALLON, 引用计数), 再开 VOUTCTR(把12V接到本通道传感器)"""
         if not self._power_on:
-            self.vcc_pin.value = True
+            boost_acquire()                  # SPWALLON 占用 (首个占用者才真开+等稳定)
+            self.vcc_pin.value = True        # VOUTCTR: 12V → 本通道传感器
             self._power_on = True
-            print(f"[RS485] CH {self.channel} power on")
-    
+            print(f"[RS485] CH {self.channel} VOUTCTR on")
+
     def power_off(self):
-        """closesensor电源"""
+        """closesensor电源: 断 VOUTCTR(隔离本通道传感器), 释放 12V 占用"""
         if self._power_on:
             time.sleep(0.05)  # 50ms wait before power off, 防止掉电损坏Flash
-            self.vcc_pin.value = False
+            self.vcc_pin.value = False       # VOUTCTR off: 真正断本通道传感器 (干净 P-FET 隔离)
             self._power_on = False
-            print(f"[RS485] CH {self.channel} power off")
+            boost_release()                  # 释放 SPWALLON 占用 (计数归零才真正关 12V)
+            print(f"[RS485] CH {self.channel} VOUTCTR off")
     
     def set_address_scan(self, enabled: bool):
         """setscan address模式"""

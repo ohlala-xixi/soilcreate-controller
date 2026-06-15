@@ -156,10 +156,21 @@ class EthernetDriver:
         return ""
     
     def deinit(self):
-        """Release resources"""
+        """Release resources — 必须释放 SPI/CS/RST, 否则同一次运行第二次实例化必 'in use',
+        且深睡前 CS/RST 仍驱高会经断电 W5500 的 ESD 二极管反灌 V3.3 轨"""
         if self._mqtt_client:
             try:
                 self._mqtt_client.disconnect()
             except:
                 pass
+            self._mqtt_client = None
         self._connected = False
+        self._eth = None
+        for attr in ("spi", "cs_pin", "rst_pin"):
+            p = getattr(self, attr, None)
+            if p is not None:
+                try:
+                    p.deinit()
+                except Exception:
+                    pass
+                setattr(self, attr, None)

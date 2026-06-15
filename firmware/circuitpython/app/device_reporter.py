@@ -20,9 +20,9 @@ def build_report(config) -> dict:
         "reset_reason": _get_reset_reason(),
     }
 
-    # boot_count: NVM 持久化
+    # boot_count: NVM 持久化 (nvm[16:18] uint16 LE, code.py 每次 boot +1)
     try:
-        boot_count = microcontroller.nvm[0] | (microcontroller.nvm[1] << 8)
+        boot_count = microcontroller.nvm[16] | (microcontroller.nvm[17] << 8)
         device["boot_count"] = boot_count
     except:
         device["boot_count"] = -1
@@ -82,6 +82,14 @@ def build_report(config) -> dict:
         "storage_period": config.get("local_storage.period", ""),
     }
 
+    # 远程下发回执: 已生效的 rev + 状态 (服务器据此判断"已生效"并清 retained)
+    try:
+        from app import remote_cmd_nvm
+        cfg["applied_rev"] = remote_cmd_nvm.read_applied_rev()
+        cfg["cfg_state"] = remote_cmd_nvm.get_cfg_state_name()
+    except Exception:
+        pass
+
     # ---- diagnostics ----
     diag = {
         "last_error": None,
@@ -109,9 +117,9 @@ def build_report(config) -> dict:
 
 
 # ---- controller-manager 硬编码 MQTT (不受 config.json 变更影响) ----
-_REPORT_BROKER = "47.95.250.46"
+_REPORT_BROKER = "***"
 _REPORT_PORT = 1883
-_REPORT_USER = "rasberdevice"
+_REPORT_USER = "***"
 _REPORT_PASS = "***"
 _REPORT_TOPIC = "controller-manager"
 

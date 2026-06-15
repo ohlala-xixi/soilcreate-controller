@@ -104,6 +104,12 @@ ETH_CS   = microcontroller.pin.GPIO12   # SPI CS
 ETH_INT  = microcontroller.pin.GPIO46   # 中断 (旧版 GPIO3)
 ETH_RST  = microcontroller.pin.GPIO3    # 复位 (旧版 GPIO46)
 
+# 板型标志: 本板 N8R2 = 8MB flash + 2MB quad-SPI PSRAM (非 octal)。
+# octal PSRAM 板 (如 N16R8) 的 PSRAM 数据线会占用部分 GPIO, 与 W5500 SPI 冲突 →
+# 那种板要禁用以太网。code.py (L296/L676) 用 pins.IS_OCTAL_PSRAM gate 以太网路径。
+# 本板 quad PSRAM, 以太网可用 → False。(缺这个定义会让开以太网时 AttributeError)
+IS_OCTAL_PSRAM = False
+
 # ============================================================
 # 4G 模组
 # ============================================================

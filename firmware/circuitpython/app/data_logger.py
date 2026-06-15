@@ -80,10 +80,13 @@ class DataLogger:
             return False
     
     def get_pending_files(self) -> list:
-        """getpendingUpload的filelist (bytimesort)"""
+        """getpendingUpload的filelist (bytimesort)
+
+        只认日期命名 (YYYYMMDD_*.json) 的缓存文件 — /data/ 里还住着
+        counter.json (UploadCounter), 误当待传数据会被补传后删掉"""
         try:
             files = os.listdir(self.DATA_DIR)
-            json_files = [f for f in files if f.endswith(".json")]
+            json_files = [f for f in files if f.endswith(".json") and f[:1].isdigit()]
             json_files.sort()
             return [f"{self.DATA_DIR}/{f}" for f in json_files]
         except:
@@ -98,10 +101,10 @@ class DataLogger:
             return False
     
     def _cleanup(self):
-        """清理oldfile，保留最new的 MAX_FILES """
+        """清理oldfile，保留最new的 MAX_FILES (只动日期命名的缓存, 不碰 counter.json)"""
         try:
             files = os.listdir(self.DATA_DIR)
-            json_files = [f for f in files if f.endswith(".json")]
+            json_files = [f for f in files if f.endswith(".json") and f[:1].isdigit()]
             
             if len(json_files) <= self.MAX_FILES:
                 return

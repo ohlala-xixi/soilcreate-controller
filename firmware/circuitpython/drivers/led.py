@@ -79,5 +79,6 @@ class LEDDriver:
     
     def deinit(self):
         """Release resources"""
-        self.stop_heartbeat()
-        self.led.deinit()
+        if self.led is not None:
+            self.led.deinit()
+            self.led = None

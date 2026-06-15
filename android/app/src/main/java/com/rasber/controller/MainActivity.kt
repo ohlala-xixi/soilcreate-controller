@@ -30,6 +30,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import com.rasber.controller.ble.BleManager
+import com.rasber.controller.ota.OtaDialog
 import org.json.JSONObject
 
 /**
@@ -46,6 +47,7 @@ class MainActivity : ComponentActivity() {
     private var _scanning = mutableStateOf(false)
     private var _devices = mutableStateOf<List<android.bluetooth.BluetoothDevice>>(emptyList())
     private var _lastData = mutableStateOf("")
+    private var _showOta = mutableStateOf(false)
     
     // 设备状态
     private var _deviceId = mutableStateOf("")
@@ -70,12 +72,9 @@ class MainActivity : ComponentActivity() {
     
     // ConfigTab 状态
     data class A4Result(val autoId: Int, val addr: Long, val a: Double, val b: Double, val z: Double)
-    data class BatchResult(val autoId: Int, val addr: Long, val model: String = "", val status: String)
     private var _a4Results = mutableStateOf<List<A4Result>>(emptyList())
     private var _a4SingleResult = mutableStateOf<A4Result?>(null)
-    private var _batchResults = mutableStateOf<List<BatchResult>>(emptyList())
     private var _configStatus = mutableStateOf("")
-    private var _batchRunning = mutableStateOf(false)
     private var _a4Running = mutableStateOf(false)
     private var _a7Status = mutableStateOf("")
     private var _configProgress = mutableStateOf(0f)
@@ -432,28 +431,6 @@ class MainActivity : ComponentActivity() {
                     } else "❌ 修改失败"
                     _configStatus.value = _a7Status.value
                 }
-                "batch_start" -> {
-                    _batchResults.value = emptyList()
-                    _batchRunning.value = true
-                    _configStatus.value = "批量写入中..."
-                }
-                "batch_result" -> {
-                    val autoId = json.optInt("auto_id")
-                    val addr = json.optLong("addr")
-                    _batchResults.value = _batchResults.value + BatchResult(autoId, addr, status = "成功")
-                    _configStatus.value = "已写入 ${_batchResults.value.size} 个"
-                }
-                "batch_progress" -> {
-                    val current = json.optInt("current")
-                    val total = json.optInt("total", 961)
-                    _configProgress.value = current.toFloat() / total
-                }
-                "batch_complete" -> {
-                    val success = json.optInt("success", 0)
-                    _batchRunning.value = false
-                    _configStatus.value = "批量写入完成，成功 $success 个"
-                    _configProgress.value = 0f
-                }
             }
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "handleBleData error: ${e.message}", e)
@@ -492,7 +469,12 @@ class MainActivity : ComponentActivity() {
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = MaterialTheme.colorScheme.primary,
                         titleContentColor = Color.White
-                    )
+                    ),
+                    actions = {
+                        TextButton(onClick = { _showOta.value = true }) {
+                            Text("升级", color = Color.White)
+                        }
+                    }
                 )
             },
             bottomBar = {
@@ -557,6 +539,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+
+        if (_showOta.value) {
+            OtaDialog(ble = bleManager, onDismiss = { _showOta.value = false })
         }
 
         if (showLeaveDialog) {
@@ -749,9 +735,7 @@ class MainActivity : ComponentActivity() {
     fun ConfigTab() {
 
         val a4SingleResult = _a4SingleResult.value
-        val batchResults = _batchResults.value
         val configStatus = _configStatus.value
-        val batchRunning = _batchRunning.value
         val a4Running = _a4Running.value
         val progress = _configProgress.value
         var selectedCom by remember { mutableStateOf("1") }
@@ -1061,155 +1045,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // ===== Section 4: 批量地址写入 =====
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Text("批量地址写入", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                    Text("扫描 AutoID 范围，匹配的设备写入固定地址（从最大地址递减）", fontSize = 12.sp, color = Color.Gray)
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    var startAutoId by remember { mutableStateOf("0") }
-                    var endAutoId by remember { mutableStateOf("960") }
-                    var maxAddr by remember { mutableStateOf("") }
-                    var delayMs by remember { mutableStateOf("300") }
-
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        OutlinedTextField(
-                            value = startAutoId,
-                            onValueChange = { startAutoId = it },
-                            label = { Text("起始AutoID", fontSize = 10.sp) },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-                        OutlinedTextField(
-                            value = endAutoId,
-                            onValueChange = { endAutoId = it },
-                            label = { Text("结束AutoID", fontSize = 10.sp) },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        OutlinedTextField(
-                            value = maxAddr,
-                            onValueChange = { maxAddr = it },
-                            label = { Text("最大地址(十进制)", fontSize = 10.sp) },
-                            placeholder = { Text("如 2334000001", fontSize = 10.sp) },
-                            modifier = Modifier.weight(2f),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-                        OutlinedTextField(
-                            value = delayMs,
-                            onValueChange = { delayMs = it },
-                            label = { Text("延时ms", fontSize = 10.sp) },
-                            modifier = Modifier.weight(1f),
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Button(
-                            onClick = {
-                                val s = startAutoId.toIntOrNull() ?: 0
-                                val e = endAutoId.toIntOrNull() ?: 960
-                                val m = maxAddr.toLongOrNull() ?: 0L
-                                val d = delayMs.toIntOrNull() ?: 300
-                                if (m > 0) {
-                                    bleManager.sendCommand("{\"cmd\":\"batch_addr_write\",\"com\":\"$selectedCom\",\"start_autoid\":$s,\"end_autoid\":$e,\"max_addr\":$m,\"delay\":$d}")
-                                }
-                            },
-                            enabled = !batchRunning,
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(if (batchRunning) "写入中..." else "开始扫描写入")
-                        }
-                        OutlinedButton(
-                            onClick = { _batchResults.value = emptyList() },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("清空列表")
-                        }
-                    }
-
-                    // 批量结果
-                    if (batchResults.isNotEmpty()) {
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text("成功: ${batchResults.size}", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Row(modifier = Modifier.fillMaxWidth().background(Color(0xFFE8F5E9)).padding(4.dp)) {
-                            Text("AutoID", modifier = Modifier.width(60.dp), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text("写入地址", modifier = Modifier.width(110.dp), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text("型号", modifier = Modifier.width(50.dp), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            Text("状态", modifier = Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                        }
-                        batchResults.takeLast(20).forEach { r ->
-                            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp, horizontal = 4.dp)) {
-                                Text("${r.autoId}", modifier = Modifier.width(60.dp), fontSize = 12.sp)
-                                Text("${r.addr}", modifier = Modifier.width(110.dp), fontSize = 12.sp)
-                                Text(r.model, modifier = Modifier.width(50.dp), fontSize = 12.sp)
-                                Text(r.status, modifier = Modifier.weight(1f), fontSize = 12.sp, color = Color(0xFF4CAF50))
-                            }
-                            Divider()
-                        }
-                    }
-
-                    // 型号操作
-                    Spacer(modifier = Modifier.height(8.dp))
-                    var batchModel by remember { mutableStateOf("0") }
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box {
-                            var batchModelExpanded by remember { mutableStateOf(false) }
-                            OutlinedButton(onClick = { batchModelExpanded = true }) {
-                                Text("型号: $batchModel", fontSize = 12.sp)
-                            }
-                            DropdownMenu(expanded = batchModelExpanded, onDismissRequest = { batchModelExpanded = false }) {
-                                listOf(
-                                    "0" to "三轴阵列(Z=g)", "1" to "三轴阵列(水平mm)", "2" to "三轴阵列(垂直Z=1000)",
-                                    "6" to "双轴固定(Z=g)", "7" to "双轴固定(mm)",
-                                    "10" to "三轴固定(Z=g)", "11" to "三轴固定(水平mm)", "12" to "三轴固定(垂直Z=1000)"
-                                ).forEach { (v, label) ->
-                                    DropdownMenuItem(
-                                        text = { Text("$v - $label", fontSize = 12.sp) },
-                                        onClick = { batchModel = v; batchModelExpanded = false }
-                                    )
-                                }
-                            }
-                        }
-                        Button(
-                            onClick = {
-                                // 只发一条 read_model 命令，固件内部串行读取所有传感器
-                                bleManager.sendCommand("{\"cmd\":\"read_model\",\"com\":\"$selectedCom\"}")
-                            },
-                            enabled = batchResults.isNotEmpty(),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("读取型号", fontSize = 12.sp)
-                        }
-                        Button(
-                            onClick = {
-                                // 使用批量 set_model 命令，固件内部串行设置（每个传感器间隔1s等待Flash写入）
-                                val m = batchModel.toIntOrNull() ?: 0
-                                bleManager.sendCommand("{\"cmd\":\"set_model\",\"com\":\"$selectedCom\",\"model\":$m}")
-                            },
-                            enabled = batchResults.isNotEmpty(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE91E63)),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("批量写型号", fontSize = 12.sp)
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -1997,60 +1832,29 @@ class MainActivity : ComponentActivity() {
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // ===== 导入配置 (下拉选源) =====
-            val configSources = listOf(
-                "出厂配置 (config.default)" to "load_default",
-                "同步配置文件 (config.json)" to "sync_config"
-            )
-            var configSrcIdx by remember { mutableStateOf(0) }
-            var configSrcExpanded by remember { mutableStateOf(false) }
+            // ===== 恢复出厂设置和地址表 (config.json 全量导入) =====
+            // config.json 同步: 文件里写了的字段(含地址表)整体覆盖 NVM, 没写的字段保留原值
             var showImportDialog by remember { mutableStateOf(false) }
-
-            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Box(modifier = Modifier.weight(1f)) {
-                    OutlinedTextField(
-                        value = configSources[configSrcIdx].first,
-                        onValueChange = {},
-                        label = { Text("配置来源") },
-                        readOnly = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        trailingIcon = { IconButton(onClick = { configSrcExpanded = true }) { Icon(Icons.Default.ArrowDropDown, "展开") } },
-                        singleLine = true
-                    )
-                    DropdownMenu(expanded = configSrcExpanded, onDismissRequest = { configSrcExpanded = false }, modifier = Modifier.fillMaxWidth(0.9f)) {
-                        configSources.forEachIndexed { idx, (label, _) ->
-                            DropdownMenuItem(text = { Text(label) }, onClick = { configSrcIdx = idx; configSrcExpanded = false })
-                        }
-                    }
-                }
-                Spacer(modifier = Modifier.width(8.dp))
-                OutlinedButton(
-                    onClick = { showImportDialog = true },
-                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF9800))
-                ) {
-                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("导入")
-                }
+            OutlinedButton(
+                onClick = { showImportDialog = true },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFFF9800))
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("恢复出厂设置和地址表 (config.json)")
             }
             if (showImportDialog) {
-                val (label, cmd) = configSources[configSrcIdx]
-                val isFactory = cmd == "load_default"
                 androidx.compose.material3.AlertDialog(
                     onDismissRequest = { showImportDialog = false },
-                    title = { Text(if (isFactory) "恢复出厂配置" else "同步配置文件") },
+                    title = { Text("恢复出厂设置和地址表") },
                     text = {
-                        Text(
-                            if (isFactory)
-                                "将从设备 /config.default 文件整体覆盖 NVM（不含地址表）。\n\n确定执行？"
-                            else
-                                "将从设备 /config.json 文件合并进 NVM（增量更新，文件没写的字段保留旧值）。\n\n确定执行？"
-                        )
+                        Text("将从设备 /config.json 导入到 NVM：文件里写了的字段（含地址表）整体覆盖，文件没写的字段保留原值。\n\n⚠️ 设备上现有的地址表会被 config.json 里的版本覆盖。\n\n确定执行？")
                     },
                     confirmButton = {
                         Button(onClick = {
-                            bleManager.sendCommand("{\"cmd\":\"$cmd\"}")
-                            saveStatus = "正在执行: $label ..."
+                            bleManager.sendCommand("{\"cmd\":\"sync_config\"}")
+                            saveStatus = "正在恢复出厂设置和地址表 ..."
                             showImportDialog = false
                         }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))) { Text("确定") }
                     },

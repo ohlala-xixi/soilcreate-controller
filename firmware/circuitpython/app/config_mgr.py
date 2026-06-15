@@ -9,15 +9,19 @@ import struct
 class ConfigManager:
     """NVM 配置管理器
 
-    NVM 布局:
-      nvm[0]     = USB 模式标志 (boot.py 独立管理)
-      nvm[1:9]   = 保留
-      nvm[10:12] = uint16 big-endian 长度头
-      nvm[12:]   = JSON UTF-8 字符串
+    NVM 全局布局 (与 app/ota_nvm.py / safemode.py / code.py 共享, 改这里务必同步):
+      nvm[0]      = USB 模式标志 (boot.py 独立管理)
+      nvm[1:16]   = OTA / safemode / boot 阶段等系统 flag (详见 app/ota_nvm.py)
+      nvm[16:32]  = 预留
+      nvm[32:34]  = uint16 big-endian 配置长度头
+      nvm[34:]    = 配置 JSON UTF-8 字符串
+    ★ 配置区从 32 起, 避开前 32 字节的系统 flag 区。旧版从 10 起会被
+      OTA(nvm[10/11/12]) / safemode(nvm[14]) / boot 阶段(nvm[15]) 写入污染,
+      每次启动改坏 config JSON → 参数存不上, 已修复。
     NVM 为空时从 /config.json 兜底读取（固件烧录时附带的初始配置）。
     """
 
-    NVM_OFFSET = 10   # 配置数据起始偏移
+    NVM_OFFSET = 32   # 配置数据起始偏移 (0..31 留给系统 flag)
     HEADER_SIZE = 2   # uint16 big-endian 长度头
     NVM_MAX = len(microcontroller.nvm) - NVM_OFFSET - HEADER_SIZE
 

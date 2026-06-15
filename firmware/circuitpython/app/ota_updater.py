@@ -1,223 +1,30 @@
-# ota_updater.py - OTA 远程固件更新
-# CircuitPython Ver
+# ota_updater.py - OTA 固件切换核心 (CircuitPython)
 #
-# 通过 WiFi HTTP 从服务器下载新版本 Python 文件并替换
-# 使用 adafruit_requests + socketpool
-#
-# 流程:
-#   1. GET /api/ota/check?version=当前版本 → 有更新?
-#   2. 逐文件 GET /api/ota/download/{ver}/{path} → 下载到 .tmp
-#   3. SHA256 校验 → 通过则 rename 替换，失败则删除 .tmp
-#   4. 全部成功 → microcontroller.reset() 重启
+# 仅保留"下载完成之后"的核心逻辑, 供 BLE OTA (app/ble_ota.py) 复用:
+#   - _apply_update():            三阶段原子切换 (备份 → 应用 /_ota_new/ → 标记 NVM → reset)
+#   - commit_after_selftest():    新固件首启自检通过后提交 (清 backup + 标记)
+#   - rollback_from_backup():     回滚到 /_ota_backup/
+#   - restore_usb_mode_after_ota(): 恢复 OTA 期间临时切的 USB 模式
+# 入口前置: /_ota_new/<path> 已是完整、校验过的新版本 (由 BLE 收帧填充)。
+# (HTTP/4G/WiFi/Ethernet 多通道下载已移除, 改走 BLE 现场推送)
 
 import os
 import json
 import hashlib
 import gc
+import time
 
+from app import ota_nvm
 
-def check_and_update(config):
-    """主入口: 检查并执行 OTA 更新
-    
-    仅支持 WiFi (需要 socketpool + adafruit_requests)
-    4G HTTP 暂未实现
-    """
-    ota_url = config.get("system.ota_url", "")
-    current_ver = config.get("system.firmware_version", "")
-    
-    if not ota_url:
-        return False
-    
-    print(f"[OTA] check: current={current_ver}, server={ota_url}")
-    
-    # 建立 HTTP 会话
-    session = _make_http_session()
-    if session is None:
-        print("[OTA] no WiFi HTTP session, skip")
-        return False
-    
-    try:
-        # 1. 检查更新
-        update_info = _check_update(session, ota_url, current_ver)
-        if update_info is None:
-            print("[OTA] no update available")
-            return False
-        
-        new_ver = update_info["version"]
-        files = update_info["files"]
-        print(f"[OTA] update found: {new_ver}, {len(files)} files")
-        
-        # 2. 逐个下载并替换
-        success = _do_update(session, ota_url, new_ver, files)
-        
-        if success:
-            # 3. 更新 config.json 中的版本号
-            _update_config_version(config, new_ver)
-            print(f"[OTA] update complete! rebooting...")
-            
-            # 4. 重启
-            import microcontroller
-            microcontroller.reset()
-        else:
-            print("[OTA] update failed, keeping current version")
-            return False
-            
-    except Exception as e:
-        print(f"[OTA] error: {e}")
-        return False
-    finally:
-        try:
-            session._free_sockets()
-        except:
-            pass
-    
-    return True
+# time.time() 阈值: 小于这个值视为时间未对齐, 跳过 OTA 防止把 NVM 写脏
+_MIN_VALID_UNIX = 1704067200  # 2024-01-01 00:00:00 UTC
 
-
-def _make_http_session():
-    """创建 HTTP 会话 (仅 WiFi)"""
-    try:
-        import wifi
-        if not wifi.radio.connected:
-            print("[OTA] WiFi not connected")
-            return None
-        
-        import socketpool
-        import adafruit_requests
-        
-        pool = socketpool.SocketPool(wifi.radio)
-        session = adafruit_requests.Session(pool)
-        return session
-    except ImportError as e:
-        print(f"[OTA] missing lib: {e}")
-        return None
-    except Exception as e:
-        print(f"[OTA] session error: {e}")
-        return None
-
-
-def _check_update(session, ota_url, current_ver):
-    """查询服务器是否有新版本
-    
-    GET {ota_url}/check?version={current_ver}
-    返回: {"update_available": true, "version": "...", "files": [...]}
-    """
-    url = f"{ota_url}/check?version={current_ver}"
-    
-    try:
-        resp = session.get(url, timeout=15)
-        if resp.status_code != 200:
-            print(f"[OTA] check failed: HTTP {resp.status_code}")
-            resp.close()
-            return None
-        
-        data = resp.json()
-        resp.close()
-        
-        if not data.get("update_available", False):
-            return None
-        
-        files = data.get("files", [])
-        if not files:
-            print("[OTA] update has no files")
-            return None
-        
-        return {
-            "version": data["version"],
-            "files": files,
-            "force": data.get("force", False)
-        }
-    except Exception as e:
-        print(f"[OTA] check error: {e}")
-        return None
-
-
-def _do_update(session, ota_url, version, files):
-    """逐个文件下载、校验、替换
-    
-    files: [{"path": "code.py", "hash": "sha256..."}, ...]
-    """
-    downloaded = []  # 已成功替换的文件 (用于失败回滚)
-    
-    for i, file_info in enumerate(files):
-        path = file_info["path"]
-        expected_hash = file_info.get("hash", "")
-        
-        print(f"[OTA] ({i+1}/{len(files)}) {path}")
-        gc.collect()
-        
-        # 下载
-        url = f"{ota_url}/download/{version}/{path}"
-        tmp_path = f"/{path}.tmp"
-        
-        try:
-            ok = _download_file(session, url, tmp_path, expected_hash)
-            if not ok:
-                print(f"[OTA] FAIL: {path}")
-                _cleanup_tmp(tmp_path)
-                _rollback(downloaded)
-                return False
-            
-            # 确保目标目录存在
-            dest_path = f"/{path}"
-            _ensure_dir(dest_path)
-            
-            # 原子替换: 删旧 → 重命名
-            try:
-                os.remove(dest_path)
-            except OSError:
-                pass  # 文件不存在也没关系 (新增文件)
-            
-            os.rename(tmp_path, dest_path)
-            downloaded.append(path)
-            print(f"[OTA] OK: {path}")
-            
-        except Exception as e:
-            print(f"[OTA] error on {path}: {e}")
-            _cleanup_tmp(tmp_path)
-            _rollback(downloaded)
-            return False
-    
-    print(f"[OTA] all {len(files)} files updated successfully")
-    return True
-
-
-def _download_file(session, url, tmp_path, expected_hash):
-    """下载单个文件到 tmp_path 并校验 SHA256"""
-    try:
-        # 确保 tmp 所在目录存在
-        _ensure_dir(tmp_path)
-        
-        resp = session.get(url, timeout=30)
-        if resp.status_code != 200:
-            print(f"[OTA] download HTTP {resp.status_code}: {url}")
-            resp.close()
-            return False
-        
-        # 流式写入 (CircuitPython 内存有限)
-        content = resp.content
-        resp.close()
-        
-        # 写入临时文件
-        with open(tmp_path, "wb") as f:
-            f.write(content)
-        
-        # SHA256 校验
-        if expected_hash:
-            actual_hash = _file_sha256(tmp_path)
-            if actual_hash != expected_hash:
-                print(f"[OTA] hash mismatch: expected {expected_hash[:16]}... got {actual_hash[:16]}...")
-                return False
-        
-        return True
-        
-    except Exception as e:
-        print(f"[OTA] download error: {e}")
-        return False
+_OTA_NEW_DIR = "/_ota_new"
+_OTA_BACKUP_DIR = "/_ota_backup"
+_OTA_IN_PROGRESS_MARKER = "/_ota_in_progress"  # 切换中标记, safemode 据此回滚
 
 
 def _file_sha256(filepath):
-    """计算文件 SHA256"""
     h = hashlib.new("sha256")
     with open(filepath, "rb") as f:
         while True:
@@ -228,20 +35,21 @@ def _file_sha256(filepath):
     return h.hexdigest()
 
 
+# ── filesystem helpers ──────────────────────────────────────
+
 def _ensure_dir(filepath):
-    """确保文件所在目录存在"""
+    """确保 filepath 所在目录存在 (递归创建)"""
     parts = filepath.rsplit("/", 1)
     if len(parts) == 2 and parts[0]:
         dir_path = parts[0]
         try:
             os.stat(dir_path)
         except OSError:
-            # 目录不存在，逐级创建
             _makedirs(dir_path)
 
 
 def _makedirs(path):
-    """递归创建目录 (CircuitPython 没有 os.makedirs)"""
+    """递归创建目录 (CircuitPython 无 os.makedirs)"""
     parts = path.strip("/").split("/")
     current = ""
     for part in parts:
@@ -255,36 +63,219 @@ def _makedirs(path):
                 pass
 
 
-def _cleanup_tmp(tmp_path):
-    """清理临时文件"""
+def _cleanup_dir(path):
+    """递归删除整个目录 (CircuitPython 无 shutil.rmtree)"""
     try:
-        os.remove(tmp_path)
+        st = os.stat(path)
     except OSError:
-        pass
+        return
+    if st[0] & 0x4000:  # S_IFDIR
+        try:
+            for name in os.listdir(path):
+                _cleanup_dir(f"{path}/{name}")
+            os.rmdir(path)
+        except OSError as e:
+            print(f"[OTA] rmdir err {path}: {e}")
+    else:
+        try:
+            os.remove(path)
+        except OSError as e:
+            print(f"[OTA] rm err {path}: {e}")
 
 
-def _rollback(downloaded_paths):
-    """回滚: 注意 — 对于已替换的文件无法真正回滚
-    (因为旧文件已被删除)，只记录警告
-    """
-    if downloaded_paths:
-        print(f"[OTA] WARNING: {len(downloaded_paths)} files already replaced before failure:")
-        for p in downloaded_paths:
-            print(f"  - {p}")
-        print("[OTA] device may need manual recovery via USB")
-
+# ── config 版本号写回 ────────────────────────────────────────
 
 def _update_config_version(config, new_version):
-    """更新 config.json 中的 firmware_version"""
     try:
         with open("/config.json", "r") as f:
             cfg = json.load(f)
-        
-        cfg["system"]["firmware_version"] = new_version
-        
+        cfg.setdefault("system", {})["firmware_version"] = new_version
         with open("/config.json", "w") as f:
             json.dump(cfg, f)
-        
         print(f"[OTA] config version updated to: {new_version}")
     except Exception as e:
-        print(f"[OTA] config update error: {e}")
+        print(f"[OTA] config update err: {e}")
+
+
+# ── 三阶段原子切换 ───────────────────────────────────────────
+#
+# 入口前置: /_ota_new/ 下已是完整新版本 (校验通过)
+#
+# 中途断电恢复路径 (★ 主兜底在 boot.py 的 _ota_rollback_guard, 不是 safemode —
+#   备份/应用阶段断电后 / 上可能没有 code.py, CircuitPython 只会安静掉 REPL,
+#   不触发 safemode; boot.py 每次启动必跑, 检测 marker+first_boot 未置 即回滚):
+#   - 备份/应用阶段断电 → marker 在 + nvm[5] 未置 → boot.py 回滚 backup → 旧版本
+#   - 应用完成、写 NVM 前断电 → 同上 (boot.py 回滚, 旧版本; 新版本这次白切, 可重推)
+#   - 应用完成、写 NVM 后断电 → marker 在 + nvm[5]=1 → boot.py 放行, 正常进自检;
+#     自检失败 → code.py FATAL handler 回滚 (普通异常) / safemode 回滚 (hard fault)
+
+def _apply_update(config, new_version, files):
+    """三阶段切换. 不返回 (microcontroller.reset)."""
+    import microcontroller
+
+    # 0. 写 in-progress marker
+    print(f"[OTA] 阶段 0/3: 标记切换开始")
+    try:
+        with open(_OTA_IN_PROGRESS_MARKER, "w") as f:
+            f.write(new_version)
+    except OSError as e:
+        print(f"[OTA] 写 marker 失败: {e} — 中止切换")
+        _cleanup_dir(_OTA_NEW_DIR)
+        return
+
+    # 1. 清旧 backup
+    _cleanup_dir(_OTA_BACKUP_DIR)
+
+    # 2. 备份当前工作区中将被替换的文件 → /_ota_backup/
+    print(f"[OTA] 阶段 1/3: 备份当前固件到 {_OTA_BACKUP_DIR}")
+    backed_up_count = 0
+    for fi in files:
+        rel = fi["path"]
+        src = "/" + rel
+        dst = _OTA_BACKUP_DIR + "/" + rel
+        if _exists(src):
+            _ensure_dir(dst)
+            try:
+                os.rename(src, dst)
+                backed_up_count += 1
+            except OSError as e:
+                print(f"[OTA] 备份失败 {src}: {e}")
+                # 失败不中止 — backup 不完整也能继续, 但 rollback 时这部分丢
+    print(f"[OTA] backup: {backed_up_count}/{len(files)} files")
+
+    # 3. 应用新版本: /_ota_new/{path} → /{path}
+    print(f"[OTA] 阶段 2/3: 应用新版本到 /")
+    applied_count = 0
+    for fi in files:
+        rel = fi["path"]
+        src = _OTA_NEW_DIR + "/" + rel
+        dst = "/" + rel
+        if not _exists(src):
+            print(f"[OTA] 新文件缺失: {src}")
+            continue
+        _ensure_dir(dst)
+        # 目标如果已存在(备份失败的情况), 先删
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        try:
+            os.rename(src, dst)
+            applied_count += 1
+        except OSError as e:
+            print(f"[OTA] 应用失败 {dst}: {e}")
+    print(f"[OTA] apply: {applied_count}/{len(files)} files")
+
+    # 4. 清空 _ota_new/ 残壳
+    _cleanup_dir(_OTA_NEW_DIR)
+
+    # 5. 写回 config.json 版本号 + NVM first_boot_flag
+    print(f"[OTA] 阶段 3/3: 写 NVM first_boot + 更新 config + 重启")
+    _update_config_version(config, new_version)
+    ota_nvm.set_first_boot_flag(True)
+    ota_nvm.reset_download_state()  # 清断点续传状态
+
+    # 6. 重启 — in_progress marker 留到自检通过再清, 是 safemode 的兜底信号
+    print(f"[OTA] 切换完成, 重启中...")
+    time.sleep(0.5)  # 让日志刷出去
+    microcontroller.reset()
+
+
+def _exists(path):
+    try:
+        os.stat(path)
+        return True
+    except OSError:
+        return False
+
+
+# ── 提供给 code.py 启动自检 / safemode 用的对外接口 ──────────
+
+def restore_usb_mode_after_ota():
+    """OTA 结束后恢复原始 USB 模式 (OTA 期间可能从 flash 临时切了 daily).
+
+    有 pending 原始模式且与当前不同 → 切回 nvm[0] + reboot (不返回).
+    无 pending → 清状态后直接返回.
+    """
+    import microcontroller
+    orig = ota_nvm.get_ota_orig_mode()
+    ota_nvm.clear_ota_resume()
+    ota_nvm.clear_ota_orig_mode()
+    if orig is None:
+        return
+    try:
+        if microcontroller.nvm[0] != orig:
+            print(f"[OTA] 恢复 USB 模式 nvm0: {microcontroller.nvm[0]} → {orig}, reboot")
+            microcontroller.nvm[0] = orig
+            time.sleep(0.5)
+            microcontroller.reset()
+    except Exception as e:
+        print(f"[OTA] restore usb mode err: {e}")
+
+
+def commit_after_selftest():
+    """新固件自检通过后调用: 清 first_boot_flag + 删 backup + 删 in-progress marker"""
+    print("[OTA] commit: 自检通过, 清理回滚资源")
+    ota_nvm.set_first_boot_flag(False)
+    _cleanup_dir(_OTA_BACKUP_DIR)
+    try:
+        os.remove(_OTA_IN_PROGRESS_MARKER)
+    except OSError:
+        pass
+    # 恢复 OTA 前的原始 USB 模式 (从 flash 临时切 daily 的, 这里切回 + reboot)
+    restore_usb_mode_after_ota()
+
+
+def rollback_from_backup():
+    """safemode 调用: 把 /_ota_backup/ 内容 mv 回 /
+
+    返回回滚的文件数. 调用方负责后续 reset.
+    """
+    if not _exists(_OTA_BACKUP_DIR):
+        return 0
+
+    print("[OTA] rollback: 从 backup 恢复旧版本")
+    restored = 0
+
+    def _walk_restore(rel_root):
+        nonlocal restored
+        bk_dir = _OTA_BACKUP_DIR + rel_root
+        try:
+            entries = os.listdir(bk_dir)
+        except OSError:
+            return
+        for name in entries:
+            bk_path = bk_dir + "/" + name
+            try:
+                st = os.stat(bk_path)
+            except OSError:
+                continue
+            if st[0] & 0x4000:  # dir
+                _walk_restore(rel_root + "/" + name)
+            else:
+                dst = "/" + (rel_root + "/" + name).lstrip("/")
+                _ensure_dir(dst)
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                try:
+                    os.rename(bk_path, dst)
+                    restored += 1
+                except OSError as e:
+                    print(f"[OTA] rollback failed {dst}: {e}")
+
+    _walk_restore("")
+    _cleanup_dir(_OTA_BACKUP_DIR)
+    ota_nvm.set_first_boot_flag(False)
+    try:
+        os.remove(_OTA_IN_PROGRESS_MARKER)
+    except OSError:
+        pass
+    print(f"[OTA] rollback: {restored} 文件已恢复")
+    return restored
+
+
+def is_in_progress():
+    """是否处在切换中 (有 marker 但 first_boot_flag 未置 = 切换被中断)"""
+    return _exists(_OTA_IN_PROGRESS_MARKER)

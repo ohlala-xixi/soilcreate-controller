@@ -9,7 +9,7 @@ import socketpool
 
 class WiFiDriver:
     """ESP32-S3 WiFi driver"""
-    
+
     def __init__(self, config):
         self.config = config
         self.ssid = config.get("network.wifi.ssid", "")
@@ -18,10 +18,15 @@ class WiFiDriver:
         self.mqtt_port = config.get("network.mqtt_port", 1883)
         self.mqtt_user = config.get("network.mqtt_user", "")
         self.mqtt_pass = config.get("network.mqtt_pass", "")
-        
+        # 下行指令订阅 topic (与 4G DTU 同一约定): cirpy-info/<cid>
+        device_id = config.get("system.id", "")
+        self.sub_topic = config.get("network.mqtt_sub_topic", "") or f"cirpy-info/{device_id}"
+
         self._connected = False
         self._pool = None
         self._mqtt_client = None
+        self._subscribed = False
+        self._downlink_msgs = []   # on_message 收到的 payload 字符串队列
         self.last_error = ""
     
     def connect(self) -> bool:
@@ -68,6 +73,7 @@ class WiFiDriver:
                 password=self.mqtt_pass if self.mqtt_pass else None,
             )
             
+            self._mqtt_client.on_message = self._on_downlink
             self._mqtt_client.connect()
             print(f"[WiFi] MQTT OK: {self.mqtt_broker}:{self.mqtt_port}")
             return True
@@ -99,7 +105,7 @@ class WiFiDriver:
         """subscribe MQTT topic"""
         if not self._mqtt_client:
             return False
-        
+
         try:
             self._mqtt_client.subscribe(topic)
             # setcallback
@@ -107,6 +113,55 @@ class WiFiDriver:
         except Exception as e:
             print(f"[WiFi] Subscribe failed: {e}")
             return False
+
+    # ── 下行指令 (cirpy-info/<cid>) ──────────────────────────────
+    #
+    # 与 4G modem 的 read_command 接口一致, app/remote_cmd.handle_remote
+    # 用 hasattr(modem, "read_command") 鉴别 — WiFi 设备从此也能收远程配置.
+
+    def _on_downlink(self, client, topic, message):
+        self._downlink_msgs.append(message)
+
+    def enable_downlink(self):
+        """订阅下行 topic. 要在 publish 数据之前调:
+        服务器收到数据立刻回 srv_ack (非 retained), 订阅晚了就错过."""
+        if not self._mqtt_client or self._subscribed or not self.sub_topic:
+            return False
+        try:
+            self._mqtt_client.subscribe(self.sub_topic, qos=1)
+            self._subscribed = True
+            print(f"[WiFi] sub: {self.sub_topic}")
+            return True
+        except Exception as e:
+            print(f"[WiFi] sub failed: {e}")
+            return False
+
+    def read_command(self, timeout_ms=3000):
+        """读一条下行 JSON (retained 指令或 srv_ack), 返回 dict 或 None (超时)"""
+        if not self._mqtt_client:
+            return None
+        self.enable_downlink()
+        import time
+        import json
+        start = time.monotonic()
+        while True:
+            if self._downlink_msgs:
+                raw = self._downlink_msgs.pop(0)
+                if raw:  # 空 payload = retained 被清, 跳过
+                    try:
+                        obj = json.loads(raw)
+                        if isinstance(obj, dict):
+                            return obj
+                    except Exception:
+                        pass
+                continue
+            if (time.monotonic() - start) >= (timeout_ms / 1000.0):
+                return None
+            try:
+                self._mqtt_client.loop(0.2)
+            except Exception as e:
+                print(f"[WiFi] mqtt loop err: {e}")
+                return None
     
     def get_ip(self) -> str:
         """获取 IP 地址"""

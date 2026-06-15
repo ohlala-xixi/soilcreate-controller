@@ -97,24 +97,30 @@ class PrivateProtocolV2026(ProtocolBase):
         data = data[start:]
         if len(data) < 6:
             return None
-        
-        # checkFrame end
-        if data[-1] != FRAME_END:
-            return None
-        
+
+        # 用 length 字段定位帧尾 (length = 整帧字节数, 见 _build_frame)。
+        # 不能用 data[-1] 当帧尾: 缓冲区尾部若有任何噪声/粘连字节, 整帧会被误判废弃。
         length = data[1]
-        command = (data[2] << 8) | data[3]
-        payload = data[4:-2]
-        checksum = data[-2]
-        
-        # verifyChecksumand
-        if self._xor_checksum(data[:-2]) != checksum:
+        if length < 6 or len(data) < length:
             return None
-        
+        frame = data[:length]
+
+        # checkFrame end
+        if frame[-1] != FRAME_END:
+            return None
+
+        command = (frame[2] << 8) | frame[3]
+        payload = frame[4:-2]
+        checksum = frame[-2]
+
+        # verifyChecksumand
+        if self._xor_checksum(frame[:-2]) != checksum:
+            return None
+
         # verifycommand
         if command != expected_command:
             return None
-        
+
         return {
             "command": command,
             "length": length,
@@ -143,9 +149,35 @@ class PrivateProtocolV2026(ProtocolBase):
         parsed = self._parse_response(response, self.RSP_READ_DATA_SLEEP)
         if not parsed:
             return None
-        
+
         return self._parse_axis_data(parsed["payload"])
-    
+
+    def read_data_awake(self, address: int, timeout_ms: int = 3500) -> dict:
+        """
+        读传感器数据 (0x5A command, 不休眠/不断电) - syncVer
+
+        与 read_data(0xA3) 唯一区别: 设备发回 0x5B 响应后保持唤醒, 不进入休眠,
+        因此适合"不断电"连续/反复读 (配合上层保持 12V 供电)。
+
+        Returns:
+            {address, a, b, z, voltage, version, status, status_raw, is_2axis}
+        """
+        data = struct.pack(">I", address)
+        command_frame = self._build_frame(self.CMD_READ_DATA_AWAKE, data)
+
+        response = self.driver.send_and_receive(
+            command_frame, response_size=30, timeout_ms=timeout_ms
+        )
+
+        if not response:
+            return None
+
+        parsed = self._parse_response(response, self.RSP_READ_DATA_AWAKE)
+        if not parsed:
+            return None
+
+        return self._parse_axis_data(parsed["payload"])
+
     def scan_address(self, auto_id: int, timeout_ms: int = 300) -> dict:
         """
         Scanaddress (A2 command)
@@ -292,7 +324,7 @@ class PrivateProtocolV2026(ProtocolBase):
             "a": a_axis,
             "b": b_axis,
             "z": z_axis,
-            "status": "C" if status == 0x03 else "E"
+            "status": "C" if status in (0x03, 0xFD) else "E"
         }
     
     def update_address(self, new_address: int, timeout_ms: int = 500):
@@ -425,7 +457,10 @@ class PrivateProtocolV2026(ProtocolBase):
             "z": z_axis,
             "voltage": voltage,
             "version": version,
-            "status": "C" if status == 0x03 else "E",
+            # 状态字节码表 (见 ref/inclinometer_client): 0x03=正常, 0xFD=量程过大, 0xFE=传感器类型错误。
+            # 量程过大(0xFD)的位移值是真实数据(大位移本就是要看的), 故按正常 C 处理, 不标 E。
+            # 只有 0xFE 等真异常才记 E。status_raw 保留原始码备查。
+            "status": "C" if status in (0x03, 0xFD) else "E",
             "status_raw": status,
             "is_2axis": is_2axis
         }

@@ -67,6 +67,12 @@ class BleManager(private val context: Context) {
     var onConnectionChanged: ((Boolean) -> Unit)? = null
     var onScanningChanged: ((Boolean) -> Unit)? = null
     var onDataReceived: ((String) -> Unit)? = null
+
+    // OTA 控制帧监听: 非空时, 收到的 JSON 行优先送这里 (OTA 期间独占), 不再走 onDataReceived
+    @Volatile var otaControlListener: ((String) -> Unit)? = null
+
+    // 协商 MTU (OTA 数据帧分片用)
+    val mtu: Int get() = negotiatedMtu
     
     fun getDevices(): List<BluetoothDevice> = _devices.toList()
     
@@ -147,19 +153,23 @@ class BleManager(private val context: Context) {
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             if (characteristic.uuid == NUS_TX_UUID) {
                 val chunk = characteristic.value?.decodeToString() ?: ""
-                Log.d(TAG, "RX chunk (${chunk.length}B): $chunk")
-                
                 receiveBuffer.append(chunk)
-                
-                val bufferStr = receiveBuffer.toString()
-                val newlinePos = bufferStr.indexOf('\n')
-                if (newlinePos >= 0) {
+
+                // 处理缓冲里所有完整行 (一次通知可能含多行)
+                while (true) {
+                    val bufferStr = receiveBuffer.toString()
+                    val newlinePos = bufferStr.indexOf('\n')
+                    if (newlinePos < 0) break
                     val line = bufferStr.substring(0, newlinePos).trim()
                     receiveBuffer.delete(0, newlinePos + 1)
-                    
-                    if (line.isNotEmpty() && line.startsWith("{")) {
-                        Log.d(TAG, "Complete msg: ${line.take(100)}...")
-                        lastReceivedData = line
+                    if (line.isEmpty() || !line.startsWith("{")) continue
+
+                    lastReceivedData = line
+                    val otaL = otaControlListener
+                    if (otaL != null) {
+                        // OTA 期间: 控制帧直接同步派发 (不走 main handler, 避免编排线程等待延迟)
+                        otaL.invoke(line)
+                    } else {
                         handler.post { onDataReceived?.invoke(line) }
                     }
                 }
@@ -203,11 +213,27 @@ class BleManager(private val context: Context) {
         handler.post { onScanningChanged?.invoke(false) }
     }
     
+    private var lastDevice: BluetoothDevice? = null
+
     fun connect(device: BluetoothDevice) {
         Log.d(TAG, "Connecting to ${device.address}...")
+        lastDevice = device
         stopScan()
         gatt?.close()
+        negotiatedMtu = 23   // 新连接 MTU 回到默认, 等 onMtuChanged 再升 (防上次连接的值残留)
         gatt = device.connectGatt(context, false, gattCallback)
+    }
+
+    /** 重连上次设备 (OTA 切 daily 重启后用)。返回是否发起。调用方轮询 isConnected 等就绪。 */
+    fun reconnect(): Boolean {
+        val d = lastDevice ?: return false
+        Log.d(TAG, "Reconnecting to ${d.address}...")
+        try { gatt?.close() } catch (_: Exception) {}
+        gatt = null
+        isConnected = false
+        negotiatedMtu = 23   // 同上: 防残留旧 MTU 导致超长写被截断
+        gatt = d.connectGatt(context, false, gattCallback)
+        return true
     }
     
     fun disconnect() {
@@ -260,9 +286,15 @@ class BleManager(private val context: Context) {
     }
     
     /**
-     * 同步写入单个 chunk — 等待 onCharacteristicWrite 回调
+     * 同步写入单个 chunk — 等待 onCharacteristicWrite 回调。
+     * 守卫: 单次写不得超过 negotiatedMtu-3 (ATT 头), 超了直接失败, 绝不静默截断。
      */
     private fun writeChunkSync(data: ByteArray): Boolean {
+        val maxLen = negotiatedMtu - 3
+        if (data.size > maxLen) {
+            Log.e(TAG, "writeChunkSync REFUSED: ${data.size}B > $maxLen (mtu=$negotiatedMtu), 会被截断")
+            return false
+        }
         val latch = CountDownLatch(1)
         writeLatch = latch
         
@@ -282,6 +314,12 @@ class BleManager(private val context: Context) {
         return false
     }
     
+    /**
+     * 写一帧 — OTA 二进制数据帧用。同步 Write-With-Response (等 onCharacteristicWrite 回调)。
+     * 板子的 NUS RX 特征对"无响应写"接收不可靠 (实测数据帧收不到), 带响应写才稳。
+     */
+    fun writeFrame(data: ByteArray): Boolean = writeChunkSync(data)
+
     fun cleanup() {
         Log.d(TAG, "Cleanup...")
         stopScan()

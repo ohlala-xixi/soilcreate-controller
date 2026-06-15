@@ -5,7 +5,19 @@ try:
     from adafruit_ble import BLERadio
     from adafruit_ble.advertising.standard import ProvideServicesAdvertisement
     from adafruit_ble.services.nordic import UARTService
+    from adafruit_ble.characteristics.stream import StreamIn
+    from adafruit_ble.uuid import VendorUUID
     _HAS_ADAFRUIT_BLE = True
+
+    class _OtaUARTService(UARTService):
+        # 覆盖 RX buffer 512→2048。OTA 一窗 = 4 帧 × (244 payload + 6 帧头) = 1000B,
+        # 之前 1024 只剩 24B 余量, 板子写 flash 暂停时下一窗易溢出截断 → 解析卡死。
+        # 2048 能整窗缓冲, 扛得住 flash 擦除暂停。(__init__ 不收 buffer_size, 用子类覆盖特征)
+        _server_rx = StreamIn(
+            uuid=VendorUUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"),
+            timeout=1.0,
+            buffer_size=2048,
+        )
 except ImportError:
     _HAS_ADAFRUIT_BLE = False
     print("[BLE] WARN: adafruit_ble library missing")
@@ -33,7 +45,8 @@ class BLEUART:
         try:
             self._ble = BLERadio()
             self._ble.name = name
-            self._uart = UARTService()
+            # 用子类把 RX buffer 调到 1024 (BLE OTA 窗口数据帧需要), TX 沿用默认 512
+            self._uart = _OtaUARTService()
             self._advertisement = ProvideServicesAdvertisement(self._uart)
             self._initialized = True
             print(f"[BLE] init done: {name}")
@@ -121,6 +134,35 @@ class BLEUART:
         except Exception as e:
             print(f"[BLE] send failed: {e}")
     
+    # ── 原始字节接口 (BLE OTA 收帧用, 绕过 poll() 的行缓冲) ──────────
+    @property
+    def in_waiting(self) -> int:
+        """NUS RX 环形缓冲里待读字节数"""
+        if not self._initialized:
+            return 0
+        try:
+            return self._uart.in_waiting
+        except Exception:
+            return 0
+
+    def read_raw(self, n: int):
+        """读最多 n 个原始字节, 返回 bytes (无则 None)。OTA 二进制分帧用。"""
+        if not self._initialized or n <= 0:
+            return None
+        try:
+            return self._uart.read(n)
+        except Exception:
+            return None
+
+    def send_raw(self, data_bytes):
+        """发原始字节 (不分片不延时, 给 OTA 控制帧/ack 用; data CDC/BLE 链路自处理)"""
+        if not self._initialized or not self._ble.connected:
+            return
+        try:
+            self._uart.write(data_bytes)
+        except Exception as e:
+            print(f"[BLE] send_raw failed: {e}")
+
     def is_connected(self) -> bool:
         """checkconnectionstatus"""
         if not self._initialized or not self._ble:

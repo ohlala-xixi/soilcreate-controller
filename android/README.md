@@ -1,6 +1,6 @@
 # 控制器配置 Android App
 
-柔性测斜仪控制器的 Android 配置应用，基于 Kotlin + Jetpack Compose。
+ESP32 柔性测斜仪控制器的 Android 配置应用，基于 Kotlin + Jetpack Compose。
 
 ## ✨ 功能特性
 

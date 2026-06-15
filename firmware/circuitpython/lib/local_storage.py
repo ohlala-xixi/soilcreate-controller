@@ -44,7 +44,7 @@ class LocalStorage:
     
     @property
     def period(self):
-        return self.config.get("local_storage.period", "month")
+        return self.config.get("local_storage.period", "day")
     
     def _get_filename(self, timestamp=None):
         """get当beforefile名"""
@@ -108,10 +108,15 @@ class LocalStorage:
         
         # checkifhas Z axisdata
         has_z = any(r.get("z") is not None for r in readings)
-        
-        # byaddresssort
-        address_list = sorted(set(r["address"] for r in readings))
-        readings_map = {r["address"]: r for r in readings}
+
+        # byaddresssort (兼容 "address"/"addr" 两种 key, 缺失则跳过该条)
+        def _addr(r):
+            return r.get("address", r.get("addr"))
+        readings = [r for r in readings if _addr(r) is not None]
+        if not readings:
+            return
+        address_list = sorted(set(_addr(r) for r in readings))
+        readings_map = {_addr(r): r for r in readings}
         
         existing = self._read_existing_data(filepath)
         
@@ -153,11 +158,7 @@ class LocalStorage:
                 z_val = f"{r.get('z', 0):.2f}" if r.get('z') is not None else ""
                 lines.append(f"{address},{z_val}")
         
-        try:
-            with open(filepath, "w") as f:
-                f.write(self.UTF8_BOM + "\n".join(lines) + "\n")
-        except Exception as e:
-            self.log(f"[Storage] write failed: {e}")
+        self._atomic_write(filepath, self.UTF8_BOM + "\n".join(lines) + "\n")
     
     def _append_column(self, filepath, existing, address_list, readings_map, ts_str, has_z):
         """Append new column to existing file"""
@@ -208,9 +209,19 @@ class LocalStorage:
                 empty_cols = "," * prev_cols
                 new_lines.append(f"{address}{empty_cols},{z_val}")
         
+        self._atomic_write(filepath, "\n".join(new_lines) + "\n")
+
+    def _atomic_write(self, filepath, content):
+        """先写 .tmp 再换名 — 整文件重写中途掉电不毁掉已有月数据"""
+        tmp = filepath + ".tmp"
         try:
-            with open(filepath, "w") as f:
-                f.write("\n".join(new_lines) + "\n")
+            with open(tmp, "w") as f:
+                f.write(content)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            os.rename(tmp, filepath)
         except Exception as e:
             self.log(f"[Storage] write failed: {e}")
     

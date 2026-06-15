@@ -208,7 +208,7 @@ config.json 存储
 
 | 参数 | 默认值 | 说明 |
 |:---|:---:|:---|
-| `mqtt_broker` | `"47.95.250.46"` | MQTT 服务器 |
+| `mqtt_broker` | `"***"` | MQTT 服务器 |
 | `mqtt_port` | `1883` | MQTT 端口 |
 | `mqtt_topic` | `"controllerdata-cirpy"` | MQTT 主题 |
 
@@ -319,7 +319,7 @@ config.json 存储
 | `#get_id` | `[设备ID] 2026750001` |
 | `#get_interval` | `[采集间隔] 5 (1小时)` |
 | `#get_sensors com1` | `[通道1] 传感器: 2026020101, 2026020100, ...` |
-| `#get_mqtt` | `[MQTT] 47.93.29.232:1883 主题:controllerdata-cirpy` |
+| `#get_mqtt` | `[MQTT] ***:1883 主题:controllerdata-cirpy` |
 | `#get_wifi` | `[WiFi] 禁用 SSID:` |
 | `#get_4g` | `[4G] 启用 APN:cmnet COPS:0` |
 | `#get_sleep` | `[休眠模式] deep` |
@@ -330,7 +330,7 @@ config.json 存储
 |:---|:---|
 | `#set_id 2026750001` | `[设备ID] 已设置: 2026750001` |
 | `#set_interval 5` | `[采集间隔] 已设置: 5 (1小时)` |
-| `#set_mqtt IP 端口 主题` | `[MQTT] 已设置: 47.93.29.232:1883 主题:topic` |
+| `#set_mqtt IP 端口 主题` | `[MQTT] 已设置: ***:1883 主题:topic` |
 | `#set_wifi SSID 密码` | `[WiFi] 已设置: MySSID` |
 | `#set_4g_apn cmnet` | `[4G APN] 已设置: cmnet` |
 | `#set_4g_cops 0` | `[4G COPS] 已设置: 0` |
