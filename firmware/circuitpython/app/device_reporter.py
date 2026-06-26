@@ -7,6 +7,11 @@ import gc
 import json
 import time
 
+try:
+    from app.fw_version import FIRMWARE_VERSION  # 版本权威来源 (随代码走, 不读 config)
+except Exception:
+    FIRMWARE_VERSION = "unknown"
+
 
 def build_report(config) -> dict:
     """构建设备状态报告 JSON"""
@@ -16,7 +21,7 @@ def build_report(config) -> dict:
     # ---- device ----
     device = {
         "id": config.get("system.id", ""),
-        "fw": config.get("system.firmware_version", ""),
+        "fw": FIRMWARE_VERSION,
         "reset_reason": _get_reset_reason(),
     }
 
@@ -116,30 +121,37 @@ def build_report(config) -> dict:
     }
 
 
-# ---- controller-manager 硬编码 MQTT (不受 config.json 变更影响) ----
-_REPORT_BROKER = "***"
-_REPORT_PORT = 1883
-_REPORT_USER = "***"
-_REPORT_PASS = "***"
-_REPORT_TOPIC = "controller-manager"
+# ---- 遥测固定端点 (单一来源 app/telemetry_endpoint.py; 不受 config.json 变更影响) ----
+try:
+    from app.telemetry_endpoint import (
+        TELEMETRY_BROKER as _REPORT_BROKER, TELEMETRY_PORT as _REPORT_PORT,
+        TELEMETRY_USER as _REPORT_USER, TELEMETRY_PASS as _REPORT_PASS,
+        TELEMETRY_TOPIC as _REPORT_TOPIC)
+except Exception:  # 模块缺失兜底 (正常不会发生), 保证 device_reporter 仍能导入
+    _REPORT_BROKER, _REPORT_PORT = "***", 1883
+    _REPORT_USER, _REPORT_PASS = "***", "***"
+    _REPORT_TOPIC = "controller-manager"
 
 
 def send_report_via_modem(config, modem):
-    """通过 4G modem 发送报告
+    """4G 遥测报告 — 尽力而为, 失败绝不影响数据/远程控制。
 
-    报告数据和传感器数据走同一个 pub topic (config.network.mqtt_topic)
-    两种 modem 驱动的 publish() 对外行为一致:
-      - YunDTU 透传: 忽略 topic 参数, 直接写串口
-      - SIMCom 原生 AT: 走 CMQTTTOPIC → CMQTTPAYLOAD → CMQTTPUB
+    - A7670G: 有独立 client 1 (publish_telemetry) → 真发到固定 telemetry broker/topic,
+      与数据 client 0 完全分开 (数据导客户 broker 时遥测仍回固定服务器)。
+    - 其他 (YunDTU 透传): 无 publish_telemetry → 回退到数据连接发 controller-manager
+      topic (透传分不开 broker, 后续多通道再说)。
     """
     try:
         report = build_report(config)
         payload = json.dumps(report)
-        topic = config.get("network.mqtt_topic", "")
-        if modem.publish(topic, payload):
+        if hasattr(modem, "publish_telemetry"):
+            ok = modem.publish_telemetry(payload)        # A7670G: 独立固定 client
+        else:
+            ok = modem.publish(_REPORT_TOPIC, payload)   # 其他: 回退到数据连接换 topic
+        if ok:
             print(f"[Report] sent {len(payload)} bytes via 4G")
             return True
-        print("[Report] 4G publish failed")
+        print("[Report] 4G publish failed (遥测尽力而为, 忽略)")
         return False
     except Exception as e:
         print(f"[Report] 4G error: {e}")

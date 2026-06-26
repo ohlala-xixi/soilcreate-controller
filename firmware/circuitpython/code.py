@@ -76,7 +76,10 @@ except Exception as e:
 # Verinfo
 # ============================================================
 
-FIRMWARE_VERSION = "2026.06.04"  # fallback, 实际从 config.json 读取
+try:
+    from app.fw_version import FIRMWARE_VERSION  # 版本号唯一权威来源 (随代码走, 不入 NVM)
+except Exception:
+    FIRMWARE_VERSION = "unknown"  # fw_version.py 缺失兜底, 防启动崩 (正常不会发生)
 
 # ============================================================
 # Helper functions
@@ -694,7 +697,7 @@ def do_network_upload(config, segments: list, existing_modem=None):
                 pass
         return None
 
-    topic = config.get("network.mqtt_topic", "controllerdata-cirpy")
+    topic = config.get("network.mqtt_topic", "controllerdata-split")
 
     # try 4G
     if config.get("network.4g.enabled", False):
@@ -2743,7 +2746,7 @@ def main():
     led = LEDDriver()
     voltage = VoltageMonitor()
     counter = UploadCounter()
-    fw_version = config.get("system.firmware_version", FIRMWARE_VERSION)
+    fw_version = FIRMWARE_VERSION  # 版本权威来自 fw_version.py, 不读 config/NVM (避免漂移)
     formatter = DataFormatter(config, counter, fw_version)
 
     # OTA 首次启动验证模式
@@ -2853,15 +2856,29 @@ def main():
     
     # ============================================================
     # 智能启动逻辑
-    # Phase 1: 3 秒 CDC 检测窗口
+    # Phase 1: CDC 检测窗口 — 冷启(RST/上电/首次部署/软reload)给 30s 等 PC tool
+    #          连上 (重启后 USB 枚举+工具重连常 >3s, 3s 太短抓不到); 现场周期
+    #          深睡唤醒 (wake_alarm=TimeAlarm) 无人交互 → 直接跳过窗口(0s)立即
+    #          采集, 不白醒省电。
     # Phase 2: 有 CDC → 交互模式等 #read (60s 无输入自动开始)
     #          无 CDC → 直接开始采集
     # ============================================================
     _boot_stage(9)
-    log("[启动] 3 秒 CDC 检测窗口...")
+    # 唤醒原因 gate: 周期深睡唤醒一定来自 TimeAlarm (见 PowerManager.deep_sleep);
+    # 冷启/RST/上电/软reload → wake_alarm=None。台架调试走冷启 → 30s 窗口。
+    try:
+        import alarm as _alarm_chk
+        _cold_boot = _alarm_chk.wake_alarm is None
+    except Exception:
+        _cold_boot = True   # 取不到唤醒原因当冷启 (宁可多等也别漏抓 CDC)
+    _cdc_window_s = 30.0 if _cold_boot else 0.0   # 周期深睡唤醒跳过窗口直接采集; 冷启等 30s
     cdc_detected = False
     detect_start = time.monotonic()
-    while (time.monotonic() - detect_start) < 3.0:
+    if _cdc_window_s > 0:
+        log(f"[启动] {int(_cdc_window_s)} 秒 CDC 检测窗口... (冷启)")
+    else:
+        log("[启动] 周期深睡唤醒 → 跳过 CDC 检测窗口, 直接采集")
+    while (time.monotonic() - detect_start) < _cdc_window_s:
         # ★ 先查输入: 任何字节都算"有人接管" → 进交互模式。必须在 process_commands 之前,
         #   否则 process_commands 会先把 in_waiting drain 光 (PC 工具探针是空行 \r\n,
         #   不是命令, 返回假但已读掉) → 永远检测不到。

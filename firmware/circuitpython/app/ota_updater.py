@@ -83,18 +83,8 @@ def _cleanup_dir(path):
             print(f"[OTA] rm err {path}: {e}")
 
 
-# ── config 版本号写回 ────────────────────────────────────────
-
-def _update_config_version(config, new_version):
-    try:
-        with open("/config.json", "r") as f:
-            cfg = json.load(f)
-        cfg.setdefault("system", {})["firmware_version"] = new_version
-        with open("/config.json", "w") as f:
-            json.dump(cfg, f)
-        print(f"[OTA] config version updated to: {new_version}")
-    except Exception as e:
-        print(f"[OTA] config update err: {e}")
+# 注: 版本号已移到 app/fw_version.py (随代码走), OTA 不再回写 config.json。
+#     新 code.py/fw_version.py 一应用, 版本即自动生效, 不依赖 config/NVM。
 
 
 # ── 三阶段原子切换 ───────────────────────────────────────────
@@ -169,9 +159,8 @@ def _apply_update(config, new_version, files):
     # 4. 清空 _ota_new/ 残壳
     _cleanup_dir(_OTA_NEW_DIR)
 
-    # 5. 写回 config.json 版本号 + NVM first_boot_flag
-    print(f"[OTA] 阶段 3/3: 写 NVM first_boot + 更新 config + 重启")
-    _update_config_version(config, new_version)
+    # 5. 标记 NVM first_boot_flag (版本号随 code.py/fw_version.py 走, 不写 config)
+    print(f"[OTA] 阶段 3/3: 写 NVM first_boot + 重启")
     ota_nvm.set_first_boot_flag(True)
     ota_nvm.reset_download_state()  # 清断点续传状态
 

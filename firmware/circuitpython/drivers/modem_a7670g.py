@@ -112,6 +112,22 @@ class ModemA7670G:
         # 每次 read_command 只消费一条, 剩余留给下次调用, 不丢字节 (同 YunDTU)。
         self._rx_text = ""
 
+        # ── 遥测独立 client (client_index 1) — 纯附加, 与数据 client 0 完全隔离 ──
+        # 钉死 telemetry broker/topic (app/telemetry_endpoint.py), 不受 config 影响。
+        # 懒连接: 仅 publish_telemetry 首次被调时 (数据上传之后) 才连, 绝不拖慢数据路径;
+        # 任何失败只返回 False, 碰不到 client 0 (数据上行/远程控制照常)。
+        self._tlm_connected = False
+        self._tlm_client_id = str(device_id) + "-tlm"  # ≠ client 0 id (默认同 broker, 同 id 会被踢)
+        try:
+            from app.telemetry_endpoint import (
+                TELEMETRY_BROKER, TELEMETRY_PORT, TELEMETRY_USER,
+                TELEMETRY_PASS, TELEMETRY_TOPIC)
+            self._tlm_broker, self._tlm_port = TELEMETRY_BROKER, TELEMETRY_PORT
+            self._tlm_user, self._tlm_pass = TELEMETRY_USER, TELEMETRY_PASS
+            self._tlm_topic = TELEMETRY_TOPIC
+        except Exception:
+            self._tlm_broker = ""   # 取不到端点 → 遥测 client 禁用, 数据照常
+
     # ── 电源 ─────────────────────────────────────────────────────
 
     def power_on(self):
@@ -206,20 +222,29 @@ class ModemA7670G:
         return False
 
     def _basic_config(self):
-        """关回显 + 详细错误码"""
+        """关回显 + 详细错误码 + 开网络自动对时 (NITZ, 有就白嫖)"""
         self._send_at("ATE0", timeout_ms=1000)
         self._send_at("AT+CMEE=2", timeout_ms=1000)
+        # CTZU=1: 注网后若基站推 NITZ, 模组自动用网络时间/时区更新 RTC。
+        # 实测电信卡不推 (CCLK 停在 70/01/01) → 还得靠 get_network_time 的 CNTP 兜底。
+        self._send_at("AT+CTZU=1", timeout_ms=1000)
         return True
 
     def _check_sim(self):
-        ok, resp = self._send_at("AT+CPIN?", timeout_ms=2000, expect="+CPIN:")
-        if not ok:
-            self.log("[A7670G] SIM 检查失败")
-            return False
-        if "READY" not in resp:
-            self.log(f"[A7670G] SIM 未就绪: {resp.strip()}")
-            return False
-        return True
+        # 冷启 8s 后 AT 已通, 但 SIM 子系统可能还在初始化 (AT+CPIN? 立即回
+        # ERROR / +CME ERROR: SIM busy)。实测裸板一次 2s + 碰 ERROR 立判死 =
+        # 误报 "SIM 检查失败" (真机 CPIN 几秒后才 READY)。改为轮询最多 ~12s,
+        # 把 ERROR / NOT READY 当 "还没好, 再等", 只有超时才真失败。
+        deadline = time.monotonic() + 12
+        last = ""
+        while time.monotonic() < deadline:
+            ok, resp = self._send_at("AT+CPIN?", timeout_ms=2000, expect="+CPIN:")
+            if ok and "READY" in resp and "NOT READY" not in resp:
+                return True
+            last = resp.strip()
+            time.sleep(1)
+        self.log(f"[A7670G] SIM 检查失败 (12s 未就绪, last: {last})")
+        return False
 
     def _read_csq(self):
         ok, resp = self._send_at("AT+CSQ", timeout_ms=1000, expect="+CSQ:")
@@ -445,6 +470,87 @@ class ModemA7670G:
 
         return True
 
+    # ── 遥测独立 client (client_index 1, 钉死端点) ───────────────
+    #
+    # 与数据 client 0 完全隔离: 自己的 CMQTTACCQ=1 / CMQTTCONNECT=1 / CMQTTPUB=1。
+    # 懒连接 + best-effort: 只在 publish_telemetry 首次被调 (数据上传之后) 才连。
+    # 任何失败都只返回 False, 绝不触碰 client 0, 不影响数据上行/远程控制。
+    # CMQTTSTART 由 client 0 连接时已调 (全局, 一次); 现有 _mqtt_cleanup 的
+    # CMQTTSTOP 会一并清掉 client 1, 故清场/deinit 无需改动。
+
+    def _telemetry_connect(self):
+        """连遥测固定 broker (client 1)。best-effort, 失败返回 False。"""
+        if not self._tlm_broker:
+            return False
+        ok, _ = self._send_at(
+            f'AT+CMQTTACCQ=1,"{self._tlm_client_id}",0', timeout_ms=2000
+        )
+        if not ok:
+            self.log("[A7670G] 遥测 CMQTTACCQ(1) 失败 (忽略, 数据不受影响)")
+            return False
+        cmd = (
+            f'AT+CMQTTCONNECT=1,"tcp://{self._tlm_broker}:{self._tlm_port}",'
+            f'60,1,"{self._tlm_user}","{self._tlm_pass}"'
+        )
+        ok, resp = self._send_at(cmd, timeout_ms=12000, expect="+CMQTTCONNECT: 1,0")
+        if not ok:
+            self.log(f"[A7670G] 遥测 CMQTTCONNECT(1) 失败: {resp.strip()} (忽略)")
+            self._send_at_silent("AT+CMQTTREL=1", timeout_ms=1000)  # 释放 ACCQ 占的槽
+            return False
+        self._tlm_connected = True
+        self.log(f"[A7670G] 遥测 client(1) 连上 {self._tlm_broker}:{self._tlm_port}")
+        return True
+
+    def publish_telemetry(self, message):
+        """遥测报告固定走 client 1 (telemetry broker / controller-manager)。
+        懒连接; 任何失败返回 False (尽力而为)。绝不触碰 client 0 (数据/远控)。"""
+        try:
+            if not self._tlm_broker:
+                return False
+            if not self._tlm_connected and not self._telemetry_connect():
+                return False
+
+            topic_bytes = self._tlm_topic.encode("utf-8")
+            msg_bytes = message.encode("utf-8") if isinstance(message, str) else message
+
+            # ── stage A: topic (client 1) ──
+            ok, _ = self._send_at(
+                f"AT+CMQTTTOPIC=1,{len(topic_bytes)}", timeout_ms=1000, expect=">"
+            )
+            if not ok:
+                self.log("[A7670G] 遥测 pub: TOPIC prompt 超时")
+                return False
+            self._raw_write(topic_bytes)
+            ok, _ = self._wait_for("OK", timeout_ms=2000)
+            if not ok:
+                self.log("[A7670G] 遥测 pub: TOPIC 未确认")
+                return False
+
+            # ── stage B: payload (client 1) ──
+            ok, _ = self._send_at(
+                f"AT+CMQTTPAYLOAD=1,{len(msg_bytes)}", timeout_ms=1000, expect=">"
+            )
+            if not ok:
+                self.log("[A7670G] 遥测 pub: PAYLOAD prompt 超时")
+                return False
+            self._raw_write(msg_bytes)
+            ok, _ = self._wait_for("OK", timeout_ms=2000)
+            if not ok:
+                self.log("[A7670G] 遥测 pub: PAYLOAD 未确认")
+                return False
+
+            # ── stage C: publish (client 1, qos=1, expiry=60s) ──
+            ok, resp = self._send_at(
+                "AT+CMQTTPUB=1,1,60", timeout_ms=8000, expect="+CMQTTPUB: 1,0"
+            )
+            if not ok:
+                self.log(f"[A7670G] 遥测 pub: PUB 无 ack ({resp.strip()})")
+                return False
+            return True
+        except Exception as e:
+            self.log(f"[A7670G] 遥测 pub 异常 (忽略): {e}")
+            return False
+
     # ── 下行指令接收 ───────────────────────────────────────────
     #
     # 订阅 (connect 末尾 _mqtt_subscribe) 后, broker 把 cirpy-info/<cid> 的 retained
@@ -488,8 +594,63 @@ class ModemA7670G:
     def is_connected(self):
         return self._connected
 
+    def _read_cclk(self):
+        """读模组 RTC → 'YY/MM/DD,HH:MM:SS±zz' (去引号), 失败 ''"""
+        ok, resp = self._send_at("AT+CCLK?", timeout_ms=2000, expect="+CCLK:")
+        if not ok:
+            return ""
+        return self._extract_value(resp, "+CCLK:").strip().strip('"')
+
+    def _cclk_year(self, cclk):
+        """从 'YY/MM/DD,...' 取 4 位年份, 失败返回 0 (70/01/01 默认值 → 1970)"""
+        try:
+            yy = int(cclk.split("/", 1)[0])
+            return (1900 + yy) if yy >= 70 else (2000 + yy)
+        except Exception:
+            return 0
+
+    def _cntp_sync(self):
+        """模组内置 NTP 客户端校 RTC (需 PDP 已激活, connect 里 _activate_pdp 之后)。
+        AT+CNTP 执行后结果走 URC '+CNTP: <code>' (1=成功; 5x/6x=网络/DNS/连接错)。"""
+        self._send_at_silent("AT+CNTPCID=1", timeout_ms=1000)  # 绑到 PDP 上下文 1 (不支持就忽略)
+        # 服务器 + 时区 (32 = +8h, 单位 15min); 国内部署固定北京时区
+        self._send_at('AT+CNTP="ntp.aliyun.com",32', timeout_ms=2000)
+        ok, resp = self._send_at("AT+CNTP", timeout_ms=3000, expect="OK")
+        if not ok:
+            self.log("[A7670G] CNTP 执行被拒")
+            return False
+        urc = resp if "+CNTP:" in resp else None   # URC 可能跟 OK 同帧到
+        if urc is None:
+            got, urc = self._wait_for("+CNTP:", timeout_ms=20000)
+            if not got:
+                self.log("[A7670G] CNTP 无 URC (超时)")
+                return False
+        code = self._extract_value(urc, "+CNTP:").strip()
+        # 实测本固件 (A7670G-LABE V1.11.2): +CNTP: 0 = 成功 (URC 后 CCLK 已更新到当前时间);
+        # 5x/6x = 网络/DNS/连接错。兼容个别固件用 1 表示成功。
+        if code.startswith("0") or code.startswith("1"):
+            self.log(f"[A7670G] CNTP 校时成功 (code={code})")
+            return True
+        self.log(f"[A7670G] CNTP 失败 code={code}")
+        return False
+
     def get_network_time(self):
-        """A7670G 通常拿不到 NITZ, 返回空字符串 (跟 YunDTU 兼容)"""
+        """取网络时间 → 'YY/MM/DD,HH:MM:SS±zz' 给 code.py 的 _parse_gsm_time, 失败 ''。
+        1) 先读 CCLK: CTZU=1 时若基站推过 NITZ, 已是有效本地时间 (全球时区自动正确);
+        2) 没填 (年份默认 1970) → 触发模组内置 CNTP 走已激活 PDP 兜底, 再读 CCLK,
+           CNTP 用 tz=32 校时 → 强制补 '+32' 后缀, 保证 code.py 换算到 UTC 确定 (国内)。
+        """
+        cclk = self._read_cclk()
+        if self._cclk_year(cclk) >= 2026:
+            self.log(f"[A7670G] 网络时间(NITZ): {cclk}")
+            return cclk
+        if self._cntp_sync():
+            cclk = self._read_cclk()
+            if self._cclk_year(cclk) >= 2026:
+                core = cclk.split("+", 1)[0].split("-", 1)[0]  # 去掉原 ±zz
+                self.log(f"[A7670G] 网络时间(CNTP): {core}+32")
+                return core + "+32"
+        self.log("[A7670G] 网络时间获取失败")
         return ""
 
     def get_signal(self):
