@@ -1,80 +1,87 @@
-# 控制器配置 Android App
+# Controller Configuration Android App
 
-ESP32 柔性测斜仪控制器的 Android 配置应用，基于 Kotlin + Jetpack Compose。
+An Android configuration app for the ESP32 flexible inclinometer controller, built with Kotlin + Jetpack Compose.
 
-## ✨ 功能特性
+## ✨ Features
 
-### 连接管理
-- **BLE 扫描**: 自动发现 UniControl 设备
-- **PIN 配对**: 安全蓝牙连接
-- **连接状态**: 实时显示连接状态
+### Connection Management
 
-### 传感器操作
-- **扫地址**: 自动扫描 485 总线上的传感器
-- **读取地址**: 从设备获取已配置的传感器列表
-- **读取数据**: 实时采集传感器数据 (A/B/Z 轴)
-- **读取型号**: 批量读取所有传感器型号
-- **设置型号**: 批量设置传感器型号
+- **BLE Scanning**: Automatically discovers UniControl devices
+- **PIN Pairing**: Secure Bluetooth connection
+- **Connection Status**: Displays connection status in real time
 
-### 传感器配置 (ConfigTab)
-- **A4 全扫**: 扫描 COM 口上所有传感器，自动填入地址
-- **地址/型号修改**: 一对一更新传感器地址和型号 (A7/C7)
-- **设置 Modbus ID**: 为传感器分配 Modbus 地址 (AB)
-- **批量写地址**: 按 AutoID 范围扫描并写入固定地址 (A0)
+### Sensor Operations
 
-### 设备配置
-- **设备 ID**: 设置设备唯一标识
-- **采集间隔**: 选择自动采集周期 (5分钟~24小时)
-- **休眠模式**: 深度/轻度休眠切换
+- **Address Scan**: Automatically scans sensors on the RS485 bus
+- **Read Addresses**: Retrieves the configured sensor list from the device
+- **Read Data**: Collects real-time sensor data across the A/B/Z axes
+- **Read Models**: Batch reads all sensor models
+- **Set Models**: Batch sets sensor models
 
-### 网络配置
-- **4G 设置**: APN、运营商选择
-- **WiFi 设置**: SSID、密码配置
-- **MQTT 设置**: 服务器、端口、主题
+### Sensor Configuration (ConfigTab)
 
-### 高级设置
-- **485 扩展**: 2/4 通道模式切换
-- **合并报文**: 全通道数据合并到一段报文
-- **本地存储**: 按日/月本地保存数据
-- **U盘模式**: 电脑/设备读写权限切换
+- **A4 Full Scan**: Scans all sensors on the COM port and automatically fills in addresses
+- **Address/Model Modification**: Updates sensor address and model one-to-one (A7/C7)
+- **Set Modbus ID**: Assigns Modbus addresses to sensors (AB)
+- **Batch Address Writing**: Scans by AutoID range and writes fixed addresses (A0)
 
-## 📱 通道支持
+### Device Configuration
 
-| 通道 | 说明 | 备注 |
+- **Device ID**: Sets the unique device identifier
+- **Acquisition Interval**: Selects the automatic acquisition cycle (5 minutes to 24 hours)
+- **Sleep Mode**: Switches between deep sleep and light sleep
+
+### Network Configuration
+
+- **4G Settings**: APN and carrier selection
+- **WiFi Settings**: SSID and password configuration
+- **MQTT Settings**: Server, port, and topic configuration
+
+### Advanced Settings
+
+- **RS485 Expansion**: Switches between 2-channel and 4-channel modes
+- **Merged Packet**: Merges full-channel data into a single packet
+- **Local Storage**: Saves data locally by day/month
+- **USB Drive Mode**: Switches computer/device read-write permissions
+
+## 📱 Channel Support
+
+| Channel | Description | Notes |
 |------|------|------|
-| COM1 | 硬件 UART1 | 默认启用 |
-| COM2 | 硬件 UART2 | 默认启用 |
-| COM3 | SC16IS752 扩展 | 需开启 485 扩展 |
-| COM4 | SC16IS752 扩展 | 需开启 485 扩展 |
+| COM1 | Hardware UART1 | Enabled by default |
+| COM2 | Hardware UART2 | Enabled by default |
+| COM3 | SC16IS752 Expansion | Requires RS485 expansion to be enabled |
+| COM4 | SC16IS752 Expansion | Requires RS485 expansion to be enabled |
 
-## 🔧 U盘模式控制
+## 🔧 USB Drive Mode Control
 
-基于 NVM (非易失性内存) 实现，任何模式下都可切换：
+Implemented based on NVM (non-volatile memory), and can be switched in any mode:
 
-| 模式 | 开关状态 | 设备 | 电脑 |
+| Mode | Switch Status | Device | Computer |
 |------|----------|------|------|
-| 日常模式 | 关闭 | **读写** | 只读 |
-| 烧录模式 | 开启 | 只读 | **读写** |
+| Daily Mode | Off | **Read/write** | Read-only |
+| Flashing Mode | On | Read-only | **Read/write** |
 
-> ⚠️ 切换后需重启设备生效
+> ⚠️ The device must be restarted for changes to take effect.
 
-## 🛠 构建
+## 🛠 Build
 
 ```bash
-# Debug 版本
+# Debug version
 ./gradlew assembleDebug
 
-# Release 版本
+# Release version
 ./gradlew assembleRelease
 ```
 
-## 📦 依赖
+## 📦 Dependencies
 
 - Kotlin 1.9+
 - Jetpack Compose
 - Nordic BLE Library
 - Material 3
 
-## 📖 BLE 协议
+## 📖 BLE Protocol
 
-详见 [固件 README](../firmware/README.md) 的 BLE 协议章节。
+See the BLE protocol section in the [Firmware README](../firmware/README.md).
+```
